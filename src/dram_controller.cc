@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cfenv>
 #include <cmath>
+#include <optional>
+#include <utility>
 #include <fmt/core.h>
 
 #include "deadlock.h"
@@ -107,7 +109,7 @@ long MEMORY_CONTROLLER::operate()
 long DRAM_CHANNEL::operate()
 {
   long progress{0};
-
+  
   if (warmup) {
     for (auto& entry : RQ) {
       if (entry.has_value()) {
@@ -633,3 +635,59 @@ void DRAM_CHANNEL::print_deadlock()
   champsim::range_print_deadlock(WQ, "WQ", q_writer, q_entry_pack);
 }
 // LCOV_EXCL_STOP
+
+MEMORY_CONTROLLER::MEMORY_CONTROLLER(const MEMORY_CONTROLLER& other)
+    : champsim::operable(other),
+      queues(other.queues),
+      channel_width(other.channel_width),
+      address_mapping(other.address_mapping),
+      data_bus_period(other.data_bus_period),
+      channels(other.channels)
+{
+  auto rebind_active = [](const DRAM_CHANNEL& src, DRAM_CHANNEL& dst) {
+    if (src.active_request == std::end(src.bank_request)) {
+      dst.active_request = std::end(dst.bank_request);
+      return;
+    }
+
+    using const_iter = DRAM_CHANNEL::request_array_type::const_iterator;
+    auto offset = std::distance(src.bank_request.cbegin(), const_iter{src.active_request});
+    dst.active_request = std::begin(dst.bank_request) + offset;
+  };
+
+  for (std::size_t i = 0; i < channels.size(); ++i) {
+    rebind_active(other.channels.at(i), channels.at(i));
+  }
+}
+
+MEMORY_CONTROLLER::MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept
+    : champsim::operable(std::move(other)),
+      queues(std::move(other.queues)),
+      channel_width(other.channel_width),
+      address_mapping(other.address_mapping),
+      data_bus_period(other.data_bus_period),
+      channels()
+{
+  std::vector<std::optional<std::size_t>> active_offsets;
+  active_offsets.reserve(other.channels.size());
+  for (auto& src : other.channels) {
+    if (src.active_request == std::end(src.bank_request)) {
+      active_offsets.emplace_back(std::nullopt);
+    } else {
+      using const_iter = DRAM_CHANNEL::request_array_type::const_iterator;
+      auto offset = std::distance(src.bank_request.cbegin(), const_iter{src.active_request});
+      active_offsets.emplace_back(static_cast<std::size_t>(offset));
+    }
+  }
+
+  channels = std::move(other.channels);
+
+  for (std::size_t i = 0; i < channels.size(); ++i) {
+    const auto& idx = active_offsets.at(i);
+    if (!idx.has_value() || *idx >= channels.at(i).bank_request.size()) {
+      channels.at(i).active_request = std::end(channels.at(i).bank_request);
+    } else {
+      channels.at(i).active_request = std::begin(channels.at(i).bank_request) + static_cast<std::ptrdiff_t>(*idx);
+    }
+  }
+}

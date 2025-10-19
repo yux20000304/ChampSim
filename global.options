@@ -1,5 +1,6 @@
 --std=c++17
--O3
+-O0
+-g
 -Wall
 -Wextra
 -Wshadow

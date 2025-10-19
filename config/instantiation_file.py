@@ -183,7 +183,7 @@ def get_ptw_builder(ptw, ul_pairs):
     required_parts = [
         '.name("{name}")',
         '.upper_levels({{{^upper_levels_string}}})',
-        '.virtual_memory(&vmem)'
+        '.virtual_memory(&{^vmem_ptr})'
     ]
 
     local_ptw_builder_parts = {
@@ -196,7 +196,8 @@ def get_ptw_builder(ptw, ul_pairs):
     uppers = (v for v in ul_pairs if v[0] == ptw.get('name'))
     local_params = {
         '^upper_levels_string': vector_string(f'&channels.at({ul_pairs.index(v)})' for v in uppers),
-        '^lower_level_queues': f'channels.at({ul_pairs.index((ptw.get("lower_level"), ptw.get("name")))})'
+        '^lower_level_queues': f'channels.at({ul_pairs.index((ptw.get("lower_level"), ptw.get("name")))})',
+        '^vmem_ptr': f'vmems.at({ptw["_vmem_index"]})'
     }
     if 'frequency' in ptw:
         local_params['^clock_period'] = int(1000000/ptw['frequency'])
@@ -295,30 +296,38 @@ def module_include_files(datas):
 
     yield from (f'#include "{f}"' for _,f in candidates)
 
-def decorate_queues(caches, ptws, pmem):
+def decorate_queues(caches, ptws, pmems):
     return util.chain(
-            *({c['name']: cache_queue_defaults(c)} for c in caches),
-            *({p['name']: ptw_queue_defaults(p)} for p in ptws),
-            {pmem['name']: {
-                    'rq_size':'std::numeric_limits<std::size_t>::max()',
-                    'wq_size':'std::numeric_limits<std::size_t>::max()',
-                    'pq_size':'std::numeric_limits<std::size_t>::max()',
-                    '_offset_bits':'champsim::lg2(BLOCK_SIZE)',
-                    '_queue_check_full_addr':False
-                }
+        *({c['name']: cache_queue_defaults(c)} for c in caches),
+        *({p['name']: ptw_queue_defaults(p)} for p in ptws),
+        *({
+            pmem['name']: {
+                'rq_size': 'std::numeric_limits<std::size_t>::max()',
+                'wq_size': 'std::numeric_limits<std::size_t>::max()',
+                'pq_size': 'std::numeric_limits<std::size_t>::max()',
+                '_offset_bits': 'champsim::lg2(BLOCK_SIZE)',
+                '_queue_check_full_addr': False
             }
+        } for pmem in pmems)
     )
 
 def get_queue_info(ul_pairs, decoration):
     return [decoration.get(ll) for ll,_ in ul_pairs]
 
-def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
+def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build_id=None):
     '''
     Generate the lines for a C++ file that instantiates a configuration.
     '''
+    if build_id is None:
+        raise ValueError('build_id is required for instantiation generation')
     classname = f'champsim::configured::generated_environment<0x{build_id}>'
     ul_pairs = get_upper_levels(cores, caches, ptws)
-    queues = get_queue_info(ul_pairs, decorate_queues(caches, ptws, pmem))
+    queues = get_queue_info(ul_pairs, decorate_queues(caches, ptws, pmems))
+
+    pmem_index = {pmem['name']: idx for idx, pmem in enumerate(pmems)}
+    vmem_index = {vmem['name']: idx for idx, vmem in enumerate(vmems)}
+    for ptw in ptws:
+        ptw['_vmem_index'] = vmem_index[ptw['vmem']]
 
     datas = itertools.filterfalse(operator.methodcaller('get', 'legacy', False), itertools.chain(
         *(c['_branch_predictor_data'] for c in cores),
@@ -329,38 +338,60 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
     yield from module_include_files(datas)
 
     # Get fastest clock period in picoseconds
-    global_clock_period = int(1000000/max(x['frequency'] for x in itertools.chain(cores, caches, ptws, (pmem,))))
+    global_clock_period = int(1000000/max(x['frequency'] for x in itertools.chain(cores, caches, ptws, pmems)))
 
     channels_head, channels_tail = util.cut((f'champsim::channel{{{queue_fmtstr.format(**v)}}}' for v in queues), n=-1)
     channel_instantiation_body = ('channels{', *(v+',' for v in channels_head), *channels_tail, '},')
 
-    pmem_instantiation_body = (
-        'DRAM{',
-        pmem_fmtstr.format(
+    dram_inits = []
+    for pmem in pmems:
+        dram_body = pmem_fmtstr.format(
             clock_period_dbus=int(1000000/pmem['data_rate']),
             clock_period_mc=int(1000000/pmem['frequency']),
             _tRP=int(pmem['tRP']),
             _tRCD=int(pmem['tRCD']),
             _tCAS=int(pmem['tCAS']),
             _tRAS=int(pmem['tRAS']),
-            _bank_rows=int(pmem['bank_rows']), #added for supporting old configs, mainly column size change
+            _bank_rows=int(pmem['bank_rows']),
             _bank_columns=int(pmem['columns']*8 if 'columns' in pmem else pmem['bank_columns']),
             _refresh_period=int(1000*pmem['refresh_period']),
             _refreshes_per_period=int(pmem['refreshes_per_period']),
             _ulptr=vector_string(f'&channels.at({ul_pairs.index(v)})' for v in ul_pairs if v[0] == pmem['name']),
-            **pmem),
-        '},'
-    )
+            **pmem
+        )
+        dram_inits.append(f'MEMORY_CONTROLLER{{{dram_body}}}')
+    drams_instantiation_body = ['drams{']
+    if dram_inits:
+        drams_instantiation_body.extend(f'  {line},' for line in dram_inits[:-1])
+        drams_instantiation_body.append(f'  {dram_inits[-1]}')
+    drams_instantiation_body.append('},')
 
-    vmem_instantiation_body = (
-        'vmem{',
-        vmem_fmtstr.format(
-            dram_name=pmem['name'], 
+    vmem_inits = []
+    for vmem in vmems:
+        dram_expr = f'drams.at({pmem_index[vmem["pmem"]]})'
+        randomization_value = '{}'
+        if not (isinstance(vmem['randomization'], bool) and vmem['randomization'] is False):
+            randomization_value = int(vmem['randomization'])
+        vmem_body = vmem_fmtstr.format(
+            dram_name=dram_expr,
             clock_period=global_clock_period,
-            _randomization= '{}' if (isinstance(vmem['randomization'],bool) and vmem['randomization'] == False) else int(vmem['randomization']),
-            **vmem),
-        '},',
-    )
+            _randomization=randomization_value,
+            **vmem
+        )
+        vmem_inits.append(f'VirtualMemory{{{vmem_body}}}')
+    vmems_instantiation_body = ['vmems{']
+    if vmem_inits:
+        vmems_instantiation_body.extend(f'  {line},' for line in vmem_inits[:-1])
+        vmems_instantiation_body.append(f'  {vmem_inits[-1]}')
+    vmems_instantiation_body.append('},')
+
+    host_records = hosts or tuple({'name': f'host{idx}'} for idx in range(len(pmems)))
+    host_label_inits = [f'"{host["name"]}"' for host in host_records]
+    host_labels_instantiation_body = ['host_labels{']
+    if host_label_inits:
+        host_labels_instantiation_body.extend(f'  {label},' for label in host_label_inits[:-1])
+        host_labels_instantiation_body.append(f'  {host_label_inits[-1]}')
+    host_labels_instantiation_body.append('},')
 
     ptw_instantiation_body = (
         'ptws {',
@@ -385,8 +416,9 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
     yield from itertools.chain(
     )
     yield from channel_instantiation_body
-    yield from pmem_instantiation_body
-    yield from vmem_instantiation_body
+    yield from drams_instantiation_body
+    yield from vmems_instantiation_body
+    yield from host_labels_instantiation_body
     yield from ptw_instantiation_body
     yield from cache_instantiation_body
     yield from core_instantiation_body
@@ -409,12 +441,20 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
         'std::transform(std::begin(cores), std::end(cores), std::back_inserter(retval), make_ref);',
         'std::transform(std::begin(caches), std::end(caches), std::back_inserter(retval), make_ref);',
         'std::transform(std::begin(ptws), std::end(ptws), std::back_inserter(retval), make_ref);',
-        'retval.push_back(std::ref<champsim::operable>(DRAM));',
+        'std::transform(std::begin(drams), std::end(drams), std::back_inserter(retval), make_ref);',
         'return retval;'
     ), rtype='std::vector<std::reference_wrapper<champsim::operable>>')
     yield ''
 
-    yield from cxx.function(f'{classname}::dram_view', [f'return {pmem["name"]};'], rtype='MEMORY_CONTROLLER&')
+    yield from cxx.function(f'{classname}::dram_view', (
+        'std::vector<std::reference_wrapper<MEMORY_CONTROLLER>> retval{};',
+        'auto make_ref = [](auto& x){ return std::ref(x); };',
+        'std::transform(std::begin(drams), std::end(drams), std::back_inserter(retval), make_ref);',
+        'return retval;'
+    ), rtype='std::vector<std::reference_wrapper<MEMORY_CONTROLLER>>')
+    yield ''
+
+    yield from cxx.function(f'{classname}::host_names', ['return host_labels;'], rtype='std::vector<std::string>')
     yield ''
 
 def get_instantiation_header(num_cpus, env, build_id):
@@ -425,8 +465,9 @@ def get_instantiation_header(num_cpus, env, build_id):
     struct_body = (
         'private:',
         'std::vector<champsim::channel> channels;',
-        'MEMORY_CONTROLLER DRAM;',
-        'VirtualMemory vmem;',
+        'std::vector<MEMORY_CONTROLLER> drams;',
+        'std::vector<VirtualMemory> vmems;',
+        'std::vector<std::string> host_labels;',
         'std::forward_list<PageTableWalker> ptws;',
         'std::forward_list<CACHE> caches;',
         'std::forward_list<O3_CPU> cores;',
@@ -440,8 +481,9 @@ def get_instantiation_header(num_cpus, env, build_id):
         'std::vector<std::reference_wrapper<O3_CPU>> cpu_view() final;',
         'std::vector<std::reference_wrapper<CACHE>> cache_view() final;',
         'std::vector<std::reference_wrapper<PageTableWalker>> ptw_view() final;',
-        'MEMORY_CONTROLLER& dram_view() final;',
-        'std::vector<std::reference_wrapper<operable>> operable_view() final;'
+        'std::vector<std::reference_wrapper<MEMORY_CONTROLLER>> dram_view() final;',
+        'std::vector<std::reference_wrapper<operable>> operable_view() final;',
+        'std::vector<std::string> host_names() final;'
     )
     struct_name = f'champsim::configured::generated_environment<0x{build_id}> final'
     yield from cxx.struct(struct_name, struct_body, superclass='champsim::environment')

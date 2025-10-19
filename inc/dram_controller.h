@@ -210,6 +210,8 @@ public:
                     std::size_t t_ras, champsim::chrono::microseconds refresh_period, std::vector<channel_type*>&& ul, std::size_t rq_size, std::size_t wq_size,
                     std::size_t chans, champsim::data::bytes chan_width, std::size_t rows, std::size_t columns, std::size_t ranks, std::size_t bankgroups,
                     std::size_t banks, std::size_t refreshes_per_period);
+  MEMORY_CONTROLLER(const MEMORY_CONTROLLER& other);
+  MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept;
 
   void initialize() final;
   long operate() final;

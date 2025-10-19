@@ -176,6 +176,15 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
       auto sublines = format(stat);
       std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
     }
+
+    for (const auto& host_stat : stats.dram_stats) {
+      lines.emplace_back("");
+      lines.emplace_back(fmt::format("Host {} Simulation DRAM", host_stat.host_name));
+      for (const auto& channel_stat : host_stat.sim_channels) {
+        auto sublines = format(channel_stat);
+        std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
+      }
+    }
   }
 
   lines.emplace_back("");
@@ -195,10 +204,13 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
 
   lines.emplace_back("");
   lines.emplace_back("DRAM Statistics");
-  for (const auto& stat : stats.roi_dram_stats) {
-    auto sublines = format(stat);
+  for (const auto& host_stat : stats.dram_stats) {
     lines.emplace_back("");
-    std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
+    lines.emplace_back(fmt::format("Host {} ROI DRAM", host_stat.host_name));
+    for (const auto& channel_stat : host_stat.roi_channels) {
+      auto sublines = format(channel_stat);
+      std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
+    }
   }
 
   return lines;

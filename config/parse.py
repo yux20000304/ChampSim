@@ -119,6 +119,12 @@ def int_or_prefixed_size(val):
         return int(val)
     return val
 
+def transform_for_keys(element, keys, transform_func):
+    '''Apply a transform function to a subset of keys in a dictionary.'''
+    if element is None:
+        return {}
+    return {k: transform_func(v) for k, v in util.subdict(element, keys).items()}
+
 def core_default_names(cpu):
     """ Apply defaults to a cpu with the given index """
     default_element_names = {n: f'{cpu["name"]}_{n}' for n in ('L1I', 'L1D', 'ITLB', 'DTLB', 'L2C', 'STLB', 'PTW')}
@@ -215,6 +221,227 @@ def extract_element(key, *parents):
 
     return util.chain(*local_elements)
 
+class SingleHostConfiguration:
+    _PINNED_CACHE_NAMES = ('L1I', 'L1D', 'ITLB', 'DTLB', 'L2C', 'STLB')
+    _CORE_KEYS = (
+        'frequency', 'ifetch_buffer_size', 'decode_buffer_size', 'dispatch_buffer_size', 'register_file_size', 'rob_size', 'lq_size',
+        'sq_size', 'fetch_width', 'decode_width', 'dispatch_width', 'execute_width', 'lq_width', 'sq_width',
+        'retire_width', 'mispredict_penalty', 'scheduler_size', 'decode_latency', 'dispatch_latency',
+        'schedule_latency', 'execute_latency', 'branch_predictor', 'btb', 'DIB'
+    )
+
+    def __init__(self, config_file, host_index=0, verbose=False):
+        self.verbose = verbose
+        self.name = config_file.get('host_name') or config_file.get('name') or f'host{host_index}'
+        prefix = config_file.get('host_prefix')
+        if prefix is None:
+            prefix = f'{self.name}_' if self.name else ''
+        self.prefix = prefix
+        self.executable_name = config_file.get('executable_name')
+
+        if verbose:
+            print('P: host', self.name or '<default>')
+
+        core_templates = duplicate_to_length(config_file.get('ooo_cpu', [{}]), config_file.get('num_cores', len(config_file.get('ooo_cpu', [{}])) or 1))
+        core_from_config = util.subdict(config_file, self._CORE_KEYS)
+        self.cores = [util.chain(cpu, core_from_config, {'name': f'{self.prefix}cpu{i}', 'host': self.name}) for i, cpu in enumerate(core_templates)]
+        if verbose:
+            print('P: host', self.name, 'core count', len(self.cores))
+
+        def prefixed_entries(entries):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get('name')
+                if name:
+                    name = self._prefixed_name(name)
+                    yield util.chain(entry, {'name': name, 'host': self.name})
+                else:
+                    yield util.chain(entry, {'host': self.name})
+
+        self.caches = util.combine_named(
+            prefixed_entries(config_file.get('caches', [])),
+            (extract_element(name, core, config_file) for core, name in itertools.product(self.cores, self._PINNED_CACHE_NAMES))
+        )
+
+        llc_conf = dict(config_file.get('LLC', {}))
+        if 'name' in llc_conf:
+            llc_name = llc_conf['name']
+        else:
+            llc_name = self._prefixed_name('LLC')
+        self.llc_name = llc_name
+        self.caches.update({llc_name: util.chain({'name': llc_name, 'host': self.name}, llc_conf)})
+
+        for cache in self.caches.values():
+            cache.setdefault('host', self.name)
+
+        self.ptws = util.combine_named(
+            config_file.get('ptws', []),
+            (extract_element('PTW', core, config_file) for core in self.cores)
+        )
+        for ptw in self.ptws.values():
+            ptw.setdefault('host', self.name)
+
+        pmem_config = dict(config_file.get('physical_memory', {}))
+        if 'frequency' in pmem_config:
+            pmem_config['data_rate'] = pmem_config['frequency']
+            pmem_config['frequency'] = pmem_config['frequency'] / 2
+        elif 'data_rate' in pmem_config:
+            pmem_config['frequency'] = pmem_config['data_rate'] / 2
+        pmem_name = pmem_config.get('name') or (self._prefixed_name('DRAM') if self.prefix else 'DRAM')
+        self.pmem = {'name': pmem_name, 'host': self.name, **pmem_config}
+
+        vmem_config = dict(config_file.get('virtual_memory', {}))
+        vmem_name = vmem_config.get('name') or (self._prefixed_name('vmem') if self.prefix else 'vmem')
+        self.vmem = {'name': vmem_name, 'host': self.name, **vmem_config}
+
+        self.root = util.subdict(config_file, ('block_size', 'page_size', 'heartbeat_frequency'))
+
+    def _prefixed_name(self, name):
+        if not name:
+            return name
+        if self.prefix and not name.startswith(self.prefix):
+            return f'{self.prefix}{name}'
+        return name
+
+    def merge(self, rhs):
+        self.cores = list(itertools.starmap(util.chain, itertools.zip_longest(self.cores, rhs.cores, fillvalue={})))
+        self.caches = util.chain(self.caches, rhs.caches)
+        self.ptws = util.chain(self.ptws, rhs.ptws)
+        self.pmem = util.chain(self.pmem, rhs.pmem)
+        self.vmem = util.chain(self.vmem, rhs.vmem)
+        self.root = util.chain(self.root, rhs.root)
+
+    def apply_defaults_in(self, branch_context, btb_context, prefetcher_context, replacement_context, root_config, global_vmem, core_index_offset=0, verbose=False):
+        combined_root = util.chain(self.root, root_config)
+        root_defaults = util.chain(
+            transform_for_keys(combined_root, ('block_size', 'page_size'), int_or_prefixed_size),
+            combined_root,
+            {
+                'block_size': int_or_prefixed_size("64B"),
+                'page_size': int_or_prefixed_size("4kB")
+            }
+        )
+
+        pmem_defaults = {
+            'data_rate': 3200, 'frequency': 1600, 'channels': 1, 'ranks': 1, 'bankgroups': 8, 'banks': 4,
+            'bank_rows': 65536, 'bank_columns': 1024, 'channel_width': 8, 'wq_size': 64, 'rq_size': 64,
+            'tRP': 24, 'tRCD': 24, 'tCAS': 24, 'tRAS': 52, 'refresh_period': 32, 'refreshes_per_period': 8192
+        }
+        pmem = util.chain(self.pmem, pmem_defaults)
+        pmem = util.chain(pmem, do_deprecation(pmem, pmem_deprecation_keys, pmem_deprecation_warnings))
+
+        vmem_combined = util.chain(self.vmem, global_vmem or {})
+        vmem = util.chain(
+            transform_for_keys(vmem_combined, ('pte_page_size',), int_or_prefixed_size),
+            vmem_combined,
+            {'pte_page_size': int_or_prefixed_size("4kB"), 'num_levels': 5, 'minor_fault_penalty': 200, 'randomization': 1}
+        )
+        vmem['host'] = self.name
+        vmem.setdefault('name', self._prefixed_name('vmem'))
+        vmem['pmem'] = pmem['name']
+
+        cores = []
+        for i, cpu in enumerate(self.cores):
+            named_core = core_default_names(cpu)
+            named_core['_index'] = core_index_offset + i
+            named_core['host'] = self.name
+            cores.append(named_core)
+
+        path_root_names = tuple(tuple(cpu[name] for cpu in cores) for name in ('L1I', 'L1D', 'ITLB', 'DTLB'))
+
+        llc_name = self.llc_name
+        default_llc = {'name': llc_name, 'host': self.name, 'lower_level': pmem['name']}
+        caches = util.combine_named(self.caches.values(), (default_llc,), *map(defaults.cache_core_defaults, cores))
+        for cache in caches.values():
+            if cache.get('host', self.name) == self.name and cache.get('lower_level') == 'LLC':
+                cache['lower_level'] = llc_name
+        llc_entry = caches.get(llc_name)
+        if llc_entry is None:
+            caches = util.combine_named(caches.values(), ({'name': llc_name, 'host': self.name, 'lower_level': pmem['name']},))
+        else:
+            llc_entry.setdefault('host', self.name)
+            if llc_entry.get('lower_level') in (None, 'LLC'):
+                llc_entry['lower_level'] = pmem['name']
+        ptws = util.combine_named(self.ptws.values(), *map(defaults.ptw_core_defaults, cores))
+
+        caches = filter_inaccessible(caches, itertools.chain(*path_root_names))
+        caches = util.combine_named(caches.values(), defaults.list_defaults(cores, caches))
+
+        branch_parse = functools.partial(module_parse, context=branch_context)
+        btb_parse = functools.partial(module_parse, context=btb_context)
+        replacement_parse = functools.partial(module_parse, context=replacement_context)
+
+        def prefetcher_parse(mod_name, cache):
+            return {
+                '_is_instruction_prefetcher': cache.get('_is_instruction_cache', False),
+                **module_parse(mod_name, prefetcher_context)
+            }
+
+        tlb_path = itertools.chain(*(util.iter_system(caches, name) for name in itertools.chain(*path_root_names[2:])))
+        data_path = itertools.chain(*(util.iter_system(caches, name) for name in itertools.chain(*path_root_names[:2])))
+        caches = util.combine_named(
+            ({'name': k, 'prefetch_activate': split_string_or_list(cache['prefetch_activate'])} for k, cache in caches.items() if 'prefetch_activate' in cache),
+            ({'name': c['name'], '_offset_bits': f'champsim::lg2({root_defaults["page_size"]})'} for c in tlb_path),
+            ({'name': c['name'], '_offset_bits': f'champsim::lg2({root_defaults["block_size"]})'} for c in data_path),
+            ({'name': c['name'], **transform_for_keys(c, ('size',), int_or_prefixed_size)} for c in caches.values()),
+            caches.values(),
+            (do_deprecation(cache, cache_deprecation_keys) for cache in caches.values()),
+            default_frequencies(cores, caches),
+            *((path_end_in(util.iter_system(caches, cpu['L1I']), pmem['name']),
+               path_end_in(util.iter_system(caches, cpu['L1D']), pmem['name']),
+               path_end_in(util.iter_system(caches, cpu['ITLB']), cpu['PTW']),
+               path_end_in(util.iter_system(caches, cpu['DTLB']), cpu['PTW'])) for cpu in cores),
+            ({'name': k,
+              '_queue_check_full_addr': cache.get('_first_level', False) or cache.get('wq_check_full_addr', False),
+              '_replacement_data': list(map(replacement_parse, util.wrap_list(cache.get('replacement', 'lru')))),
+              '_prefetcher_data': [*map(functools.partial(prefetcher_parse, cache=cache), util.wrap_list(cache.get('prefetcher', 'no')))]
+             } for k, cache in caches.items())
+        )
+
+        ptws = util.combine_named(
+            ptws.values(),
+            (do_deprecation(ptw, ptw_deprecation_keys) for ptw in ptws.values()),
+            ({'name': cpu['PTW'], 'frequency': cpu.get('frequency'), 'cpu': cpu.get('_index'), '_queue_factor': 32, 'host': self.name} for cpu in cores)
+        )
+
+        cores = list(util.combine_named(
+            cores,
+            ({
+                'name': c['name'],
+                '_branch_predictor_data': [*map(branch_parse, util.wrap_list(c.get('branch_predictor', 'hashed_perceptron')))],
+                '_btb_data': [*map(btb_parse, util.wrap_list(c.get('btb', 'basic_btb')))]
+            } for c in cores)
+        ).values())
+
+        for cache in caches.values():
+            cache['host'] = self.name
+        for ptw in ptws.values():
+            ptw['host'] = self.name
+            ptw['vmem'] = vmem['name']
+
+        host_meta = {
+            'name': self.name,
+            'pmem': pmem['name'],
+            'vmem': vmem['name'],
+            'llc': llc_name,
+            'core_indices': [c['_index'] for c in cores],
+            'core_names': [c['name'] for c in cores]
+        }
+
+        return (
+            {
+                'cores': tuple(cores),
+                'caches': tuple(caches.values()),
+                'ptws': tuple(ptws.values()),
+                'pmem': pmem,
+                'vmem': vmem,
+                'host': host_meta
+            },
+            core_index_offset + len(cores)
+        )
+
+
 class NormalizedConfiguration:
     '''
     The internal representation of a JSON configuration.
@@ -225,101 +452,53 @@ class NormalizedConfiguration:
 
     def __init__(self, config_file, verbose=False):
         ''' Normalize a JSON configuration in preparation for parsing '''
-        # Copy or trim cores as necessary to fill out the specified number of cores
-        self.cores = duplicate_to_length(config_file.get('ooo_cpu', [{}]), config_file.get('num_cores', 1))
+        base_host_config = {k: v for k, v in config_file.items() if k != 'hosts'}
+        host_configs = config_file.get('hosts', [])
+        self.verbose = verbose
 
-        # Default core elements
-        core_from_config = util.subdict(config_file,
-            (
-                'frequency', 'ifetch_buffer_size', 'decode_buffer_size', 'dispatch_buffer_size', 'register_file_size', 'rob_size', 'lq_size',
-                'sq_size', 'fetch_width', 'decode_width', 'dispatch_width', 'execute_width', 'lq_width', 'sq_width',
-                'retire_width', 'mispredict_penalty', 'scheduler_size', 'decode_latency', 'dispatch_latency',
-                'schedule_latency', 'execute_latency', 'branch_predictor', 'btb', 'DIB'
-            )
-        )
-        self.cores = [util.chain(cpu, core_from_config, {'name': f'cpu{i}'}) for i,cpu in enumerate(self.cores)]
+        if host_configs:
+            self.hosts = []
+            for index, host_cfg in enumerate(host_configs):
+                combined = util.chain(host_cfg, base_host_config)
+                combined = dict(combined)
+                combined.setdefault('host_name', host_cfg.get('name', f'host{index}'))
+                if 'host_prefix' not in combined:
+                    combined['host_prefix'] = host_cfg.get('host_prefix') or host_cfg.get('name_prefix') or f"{combined['host_name']}_"
+                self.hosts.append(SingleHostConfiguration(combined, host_index=index, verbose=verbose))
+        else:
+            single_config = dict(base_host_config)
+            single_config.setdefault('host_name', config_file.get('name', 'host0'))
+            single_config.setdefault('host_prefix', '')
+            self.hosts = [SingleHostConfiguration(single_config, host_index=0, verbose=verbose)]
 
-        if verbose:
-            print('P: core count', len(self.cores))
-
-        pinned_cache_names = ('L1I', 'L1D', 'ITLB', 'DTLB', 'L2C', 'STLB')
-        self.caches = util.combine_named(
-            config_file.get('caches', []),
-            (extract_element(name, core, config_file) for core, name in itertools.product(self.cores, pinned_cache_names))
-        )
-
-        # Read LLC from the configuration file
-        if 'LLC' in config_file:
-            self.caches.update(LLC={'name': 'LLC', **config_file['LLC']})
-
-        if verbose:
-            print('P: caches', list(self.caches.keys()))
-
-        self.ptws = util.combine_named(
-            config_file.get('ptws',[]),
-            (extract_element('PTW', core, config_file) for core in self.cores)
-        )
-
-        if verbose:
-            print('P: ptws', list(self.ptws.keys()))
-
-        # Convert all core values to labels
-        self.cores = [
-            util.chain(*(
-                {n: cpu[n].get('name', f'{cpu["name"]}_{n}')}
-                for n in (*pinned_cache_names, 'PTW') if isinstance(cpu.get(n), dict)
-            ),
-            cpu
-        ) for cpu in self.cores]
-
-        # The name 'DRAM' is reserved for the physical memory
-        self.caches = {k:v for k,v in self.caches.items() if k != 'DRAM'}
-
-        self.pmem = config_file.get('physical_memory', {})
-        
-        #this allows frequency to be specified instead of data rate or vice-versa for DRAM
-        if('frequency' in self.pmem.keys()):
-            self.pmem['data_rate'] = self.pmem['frequency']
-            self.pmem['frequency'] = self.pmem['frequency']/2
-        elif('data_rate' in self.pmem.keys()):
-            self.pmem['frequency'] = self.pmem['data_rate']/2
-
-        if verbose:
-            print('P: pmem', list(self.pmem.keys()))
-
-        self.vmem = config_file.get('virtual_memory', {})
-
-        if verbose:
-            print('P: vmem', list(self.vmem.keys()))
-
-        self.root = util.subdict(config_file,
-            ('block_size', 'page_size', 'heartbeat_frequency')
-        )
+        self.root = util.subdict(config_file, ('block_size', 'page_size', 'heartbeat_frequency'))
+        self.global_vmem = config_file.get('virtual_memory', {})
+        self.executable_name = config_file.get('executable_name')
 
     def merge(self, rhs):
         ''' Merge another configuration into this one '''
-        self.cores = list(itertools.starmap(util.chain, itertools.zip_longest(self.cores, rhs.cores, fillvalue={})))
-        self.caches = util.chain(self.caches, rhs.caches)
-        self.ptws = util.chain(self.ptws, rhs.ptws)
-        self.pmem = util.chain(self.pmem, rhs.pmem)
-        self.vmem = util.chain(self.vmem, rhs.vmem)
+        existing = {host.name: host for host in self.hosts}
+        ordered_hosts = list(self.hosts)
+        for other in rhs.hosts:
+            if other.name in existing:
+                existing[other.name].merge(other)
+            else:
+                ordered_hosts.append(other)
+                existing[other.name] = other
+        self.hosts = ordered_hosts
         self.root = util.chain(self.root, rhs.root)
+        self.global_vmem = util.chain(self.global_vmem, rhs.global_vmem)
+        self.executable_name = rhs.executable_name or self.executable_name
 
     def apply_defaults_in(self, branch_context, btb_context, prefetcher_context, replacement_context, verbose=False):
-        ''' Apply defaults and produce a result suitible for writing the generated files. '''
+        ''' Apply defaults and produce a result suitable for writing the generated files. '''
         if verbose:
             print('D: keys in root', list(self.root.keys()))
-            for cpu in self.cores:
-                print('D: core', cpu['name'], list(cpu.keys()))
-            for cache in self.caches.values():
-                print('D: cache', cache['name'], list(cache.keys()))
-            for ptw in self.ptws.values():
-                print('D: ptw', ptw['name'], list(ptw.keys()))
+            for host in self.hosts:
+                for cpu in host.cores:
+                    print('D: host', host.name, 'core', cpu['name'], list(cpu.keys()))
 
-        def transform_for_keys(element, keys, transform_func):
-            return { k:transform_func(v) for k,v in util.subdict(element, keys).items() }
-
-        root_config = util.chain(
+        root_defaults = util.chain(
             transform_for_keys(self.root, ('block_size', 'page_size'), int_or_prefixed_size),
             self.root,
             {
@@ -328,123 +507,50 @@ class NormalizedConfiguration:
             }
         )
 
-        pmem = util.chain(self.pmem, {
-            'name': 'DRAM', 'data_rate': 3200, 'frequency': 1600, 'channels': 1, 'ranks': 1, 'bankgroups': 8, 'banks': 4, 'bank_rows': 65536, 'bank_columns': 1024,
-            'channel_width': 8, 'wq_size': 64, 'rq_size': 64, 'tRP': 24, 'tRCD': 24, 'tCAS': 24, 'tRAS' : 52,
-            'refresh_period': 32, 'refreshes_per_period': 8192
-        })
-        pmem = util.chain(pmem,(do_deprecation(pmem, pmem_deprecation_keys,pmem_deprecation_warnings)))
-        
-        #convert vmem boolean to string
-        vmem = util.chain(
-            transform_for_keys(self.vmem, ('pte_page_size',), int_or_prefixed_size),
-            self.vmem,
-            { 'pte_page_size': int_or_prefixed_size("4kB"), 'num_levels': 5, 'minor_fault_penalty': 200, 'randomization': 1}
-        )
+        cores = []
+        caches = []
+        ptws = []
+        pmems = []
+        vmems = []
+        hosts_meta = []
 
-        # Give cores numeric indices and default cache names
-        cores = [{'_index': i, **core_default_names(cpu)} for i,cpu in enumerate(self.cores)]
+        core_index_offset = 0
+        for host in self.hosts:
+            host_elements, core_index_offset = host.apply_defaults_in(
+                branch_context=branch_context,
+                btb_context=btb_context,
+                prefetcher_context=prefetcher_context,
+                replacement_context=replacement_context,
+                root_config=root_defaults,
+                global_vmem=self.global_vmem,
+                core_index_offset=core_index_offset,
+                verbose=verbose
+            )
+            cores.extend(host_elements['cores'])
+            caches.extend(host_elements['caches'])
+            ptws.extend(host_elements['ptws'])
+            pmems.append(host_elements['pmem'])
+            vmems.append(host_elements['vmem'])
+            hosts_meta.append(host_elements['host'])
 
-        path_root_names = tuple(tuple(cpu[name] for cpu in cores) for name in ('L1I', 'L1D', 'ITLB', 'DTLB'))
-
-        # Instantiate any missing default caches
-        caches = util.combine_named(self.caches.values(), ({ 'name': 'LLC' },), *map(defaults.cache_core_defaults, cores))
-        ptws = util.combine_named(self.ptws.values(), *map(defaults.ptw_core_defaults, cores))
-
-        # Remove caches that are inaccessible
-        caches = filter_inaccessible(caches, itertools.chain(*path_root_names))
-
-        # Follow paths and apply default sizings
-        caches = util.combine_named(caches.values(), defaults.list_defaults(cores, caches))
-
-        branch_parse = functools.partial(module_parse, context=branch_context)
-        btb_parse = functools.partial(module_parse, context=btb_context)
-        replacement_parse = functools.partial(module_parse, context=replacement_context)
-        def prefetcher_parse(mod_name, cache):
-            return {
-                '_is_instruction_prefetcher': cache.get('_is_instruction_cache', False),
-                **module_parse(mod_name, prefetcher_context)
-            }
-
-        tlb_path = itertools.chain(*(util.iter_system(caches, name) for name in itertools.chain(*path_root_names[2:])))
-        data_path = itertools.chain(*(util.iter_system(caches, name) for name in itertools.chain(*path_root_names[:2])))
-        caches = util.combine_named(
-            # Set prefetcher_activate
-            ({ 'name': k,
-               'prefetch_activate': split_string_or_list(cache['prefetch_activate'])
-            } for k,cache in caches.items() if 'prefetch_activate' in cache),
-
-            # TLBs use page offsets, Caches use block offsets
-            ({'name': c['name'], '_offset_bits': f'champsim::lg2({root_config["page_size"]})'} for c in tlb_path),
-            ({'name': c['name'], '_offset_bits': f'champsim::lg2({root_config["block_size"]})'} for c in data_path),
-
-            # Unfold suffixed strings
-            ({'name': c['name'], **transform_for_keys(c, ('size',), int_or_prefixed_size)} for c in caches.values()),
-
-            caches.values(),
-
-            ## DEPRECATION
-            # The listed keys are deprecated. For now, permit them but print a warning
-            (do_deprecation(cache, cache_deprecation_keys) for cache in caches.values()),
-
-            # Pass frequencies on to lower levels
-            default_frequencies(cores, caches),
-
-            # The end of the data path is the physical memory
-            *((
-                path_end_in(util.iter_system(caches, cpu['L1I']), 'DRAM'),
-                path_end_in(util.iter_system(caches, cpu['L1D']), 'DRAM'),
-                path_end_in(util.iter_system(caches, cpu['ITLB']), cpu['PTW']),
-                path_end_in(util.iter_system(caches, cpu['DTLB']), cpu['PTW'])
-             ) for cpu in cores),
-
-            ({ 'name': k,
-                # Mark queues that need to match full addresses on collision
-               '_queue_check_full_addr': cache.get('_first_level', False) or cache.get('wq_check_full_addr', False),
-
-                # Get module path names and unique module names
-               '_replacement_data': list(map(replacement_parse, util.wrap_list(cache.get('replacement', 'lru')))),
-               '_prefetcher_data': [*map(functools.partial(prefetcher_parse, cache=cache), util.wrap_list(cache.get('prefetcher', 'no')))]
-            } for k,cache in caches.items())
-        )
-
-        ptws = util.combine_named(
-            ptws.values(),
-
-            ## DEPRECATION
-            # The listed keys are deprecated. For now, permit them but print a warning
-            (do_deprecation(ptw, ptw_deprecation_keys) for ptw in ptws.values()),
-
-            ({ 'name': cpu['PTW'], 'frequency': cpu.get('frequency'), 'cpu': cpu.get('_index'), '_queue_factor': 32 } for cpu in cores)
-        )
-
-        cores = list(util.combine_named(cores,
-            ({
-                'name': c['name'],
-                '_branch_predictor_data':
-                    [*map(branch_parse, util.wrap_list(c.get('branch_predictor', 'hashed_perceptron')))],
-                '_btb_data':
-                    [*map(btb_parse, util.wrap_list(c.get('btb', 'basic_btb')))]
-             } for c in cores),
-            ).values()
-        )
-
-        elements = {
-            'cores': cores,
-            'caches': tuple(caches.values()),
-            'ptws': tuple(ptws.values()),
-            'pmem': pmem,
-            'vmem': vmem
-        }
         module_info = {
-            'repl': util.combine_named(*(c['_replacement_data'] for c in caches.values()), replacement_context.find_all()),
-            'pref': util.combine_named(*(c['_prefetcher_data'] for c in caches.values()), prefetcher_context.find_all()),
+            'repl': util.combine_named(*(c['_replacement_data'] for c in caches), replacement_context.find_all()),
+            'pref': util.combine_named(*(c['_prefetcher_data'] for c in caches), prefetcher_context.find_all()),
             'branch': util.combine_named(*(c['_branch_predictor_data'] for c in cores), branch_context.find_all()),
             'btb': util.combine_named(*(c['_btb_data'] for c in cores), btb_context.find_all())
         }
 
+        elements = {
+            'cores': tuple(cores),
+            'caches': tuple(caches),
+            'ptws': tuple(ptws),
+            'pmems': tuple(pmems),
+            'vmems': tuple(vmems),
+            'hosts': tuple(hosts_meta)
+        }
+
         config_extern = {
-            **util.subdict(root_config, ('block_size', 'page_size', 'heartbeat_frequency')),
+            **util.subdict(root_defaults, ('block_size', 'page_size', 'heartbeat_frequency')),
             'num_cores': len(cores)
         }
 

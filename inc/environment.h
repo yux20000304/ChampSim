@@ -18,6 +18,7 @@
 #define ENVIRONMENT_H
 
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "cache.h"
@@ -32,8 +33,9 @@ struct environment {
   virtual std::vector<std::reference_wrapper<O3_CPU>> cpu_view() = 0;
   virtual std::vector<std::reference_wrapper<CACHE>> cache_view() = 0;
   virtual std::vector<std::reference_wrapper<PageTableWalker>> ptw_view() = 0;
-  virtual MEMORY_CONTROLLER& dram_view() = 0;
+  virtual std::vector<std::reference_wrapper<MEMORY_CONTROLLER>> dram_view() = 0;
   virtual std::vector<std::reference_wrapper<operable>> operable_view() = 0;
+  virtual std::vector<std::string> host_names() = 0;
 };
 
 namespace configured

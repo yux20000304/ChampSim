@@ -90,14 +90,20 @@ void to_json(nlohmann::json& j, const champsim::phase_stats stats)
 {
   std::map<std::string, nlohmann::json> roi_stats;
   roi_stats.emplace("cores", stats.roi_cpu_stats);
-  roi_stats.emplace("DRAM", stats.roi_dram_stats);
+  nlohmann::json dram_roi = nlohmann::json::array();
+  nlohmann::json dram_sim = nlohmann::json::array();
+  for (const auto& host_stat : stats.dram_stats) {
+    dram_roi.push_back({{"host", host_stat.host_name}, {"channels", host_stat.roi_channels}});
+    dram_sim.push_back({{"host", host_stat.host_name}, {"channels", host_stat.sim_channels}});
+  }
+  roi_stats.emplace("DRAM", dram_roi);
   for (auto x : stats.roi_cache_stats) {
     roi_stats.emplace(x.name, x);
   }
 
   std::map<std::string, nlohmann::json> sim_stats;
   sim_stats.emplace("cores", stats.sim_cpu_stats);
-  sim_stats.emplace("DRAM", stats.sim_dram_stats);
+  sim_stats.emplace("DRAM", dram_sim);
   for (auto x : stats.sim_cache_stats) {
     sim_stats.emplace(x.name, x);
   }

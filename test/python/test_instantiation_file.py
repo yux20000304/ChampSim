@@ -265,7 +265,7 @@ class DecorateQueuesTests(unittest.TestCase):
         ]
         ptws = []
 
-        evaluated = config.instantiation_file.decorate_queues(caches, ptws, {'name': 'DRAM'})
+        evaluated = config.instantiation_file.decorate_queues(caches, ptws, [{'name': 'DRAM'}])
 
         self.assertEqual(evaluated.get('test_l2').get('rq_size'), 2)
         self.assertEqual(evaluated.get('test_l2').get('wq_size'), 2)

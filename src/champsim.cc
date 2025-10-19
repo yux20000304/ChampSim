@@ -88,6 +88,7 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
     auto next_phase_complete = phase_complete;
     global_clock.tick(time_quantum);
 
+    
     auto progress = do_cycle(env, traces, trace_index, global_clock);
 
     if (progress == 0) {
@@ -171,11 +172,19 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
   std::transform(std::begin(caches), std::end(caches), std::back_inserter(stats.sim_cache_stats), [](const CACHE& cache) { return cache.sim_stats; });
   std::transform(std::begin(caches), std::end(caches), std::back_inserter(stats.roi_cache_stats), [](const CACHE& cache) { return cache.roi_stats; });
 
-  auto dram = env.dram_view();
-  std::transform(std::begin(dram.channels), std::end(dram.channels), std::back_inserter(stats.sim_dram_stats),
-                 [](const DRAM_CHANNEL& chan) { return chan.sim_stats; });
-  std::transform(std::begin(dram.channels), std::end(dram.channels), std::back_inserter(stats.roi_dram_stats),
-                 [](const DRAM_CHANNEL& chan) { return chan.roi_stats; });
+  auto drams = env.dram_view();
+  auto host_labels = env.host_names();
+  stats.dram_stats.reserve(drams.size());
+  for (std::size_t i = 0; i < drams.size(); ++i) {
+    const MEMORY_CONTROLLER& dram = drams.at(i).get();
+    phase_stats::dram_host_stats host_stat;
+    host_stat.host_name = i < host_labels.size() ? host_labels.at(i) : fmt::format("host{}", i);
+    std::transform(std::begin(dram.channels), std::end(dram.channels), std::back_inserter(host_stat.sim_channels),
+                   [](const DRAM_CHANNEL& chan) { return chan.sim_stats; });
+    std::transform(std::begin(dram.channels), std::end(dram.channels), std::back_inserter(host_stat.roi_channels),
+                   [](const DRAM_CHANNEL& chan) { return chan.roi_stats; });
+    stats.dram_stats.push_back(std::move(host_stat));
+  }
 
   return stats;
 }

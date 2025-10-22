@@ -175,7 +175,10 @@
     "tRP": 24,
     "tRAS": 52,
     "refresh_period": 32,
-    "refreshes_per_period": 8192
+    "refreshes_per_period": 8192,
+    "cxl_ratio": 0.5,
+    "cxl_read_penalty_ps": 0,
+    "cxl_write_penalty_ps": 0
   },
 
   "virtual_memory": {

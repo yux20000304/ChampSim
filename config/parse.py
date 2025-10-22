@@ -326,10 +326,22 @@ class SingleHostConfiguration:
         pmem_defaults = {
             'data_rate': 3200, 'frequency': 1600, 'channels': 1, 'ranks': 1, 'bankgroups': 8, 'banks': 4,
             'bank_rows': 65536, 'bank_columns': 1024, 'channel_width': 8, 'wq_size': 64, 'rq_size': 64,
-            'tRP': 24, 'tRCD': 24, 'tCAS': 24, 'tRAS': 52, 'refresh_period': 32, 'refreshes_per_period': 8192
+            'tRP': 24, 'tRCD': 24, 'tCAS': 24, 'tRAS': 52, 'refresh_period': 32, 'refreshes_per_period': 8192,
+            'cxl_ratio': 0.0, 'cxl_read_penalty_ps': 0, 'cxl_write_penalty_ps': 0
         }
         pmem = util.chain(self.pmem, pmem_defaults)
         pmem = util.chain(pmem, do_deprecation(pmem, pmem_deprecation_keys, pmem_deprecation_warnings))
+
+        try:
+            pmem['cxl_ratio'] = float(pmem.get('cxl_ratio', 0.0))
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid cxl_ratio for physical memory '{pmem.get('name', '<unnamed>')}'")
+
+        for key in ('cxl_read_penalty_ps', 'cxl_write_penalty_ps'):
+            try:
+                pmem[key] = int(pmem.get(key, 0))
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid {key} for physical memory '{pmem.get('name', '<unnamed>')}'")
 
         vmem_combined = util.chain(self.vmem, global_vmem or {})
         vmem = util.chain(
@@ -510,7 +522,7 @@ class NormalizedConfiguration:
         cores = []
         caches = []
         ptws = []
-        pmems = []
+        pmems = {}
         vmems = []
         hosts_meta = []
 
@@ -529,7 +541,15 @@ class NormalizedConfiguration:
             cores.extend(host_elements['cores'])
             caches.extend(host_elements['caches'])
             ptws.extend(host_elements['ptws'])
-            pmems.append(host_elements['pmem'])
+
+            pmem_entry = {k: v for k, v in host_elements['pmem'].items() if k != 'host'}
+            pmem_name = pmem_entry.get('name')
+            if pmem_name is None:
+                raise ValueError("Physical memory entries must have a name to support multi-host configurations")
+            if pmem_name in pmems and pmems[pmem_name] != pmem_entry:
+                raise ValueError(f"Conflicting definitions for physical memory '{pmem_name}' across hosts")
+            pmems.setdefault(pmem_name, pmem_entry)
+
             vmems.append(host_elements['vmem'])
             hosts_meta.append(host_elements['host'])
 
@@ -544,7 +564,7 @@ class NormalizedConfiguration:
             'cores': tuple(cores),
             'caches': tuple(caches),
             'ptws': tuple(ptws),
-            'pmems': tuple(pmems),
+            'pmems': tuple(pmems.values()),
             'vmems': tuple(vmems),
             'hosts': tuple(hosts_meta)
         }

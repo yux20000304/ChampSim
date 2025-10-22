@@ -106,7 +106,7 @@ std::size_t VirtualMemory::available_ppages() const { return (ppage_free_list.si
 
 std::pair<champsim::page_number, champsim::chrono::clock::duration> VirtualMemory::va_to_pa(uint32_t cpu_num, champsim::page_number vaddr)
 {
-  auto [ppage, fault] = vpage_to_ppage_map.try_emplace({cpu_num, champsim::page_number{vaddr}}, ppage_front());
+  auto [ppage, fault] = vpage_to_ppage_map.try_emplace({0, champsim::page_number{vaddr}}, ppage_front());
 
   // this vpage doesn't yet have a ppage mapping
   if (fault) {
@@ -131,7 +131,7 @@ std::pair<champsim::address, champsim::chrono::clock::duration> VirtualMemory::g
 
   champsim::dynamic_extent pte_table_entry_extent{champsim::address::bits, shamt(level)};
   auto [ppage, fault] =
-      page_table.try_emplace({cpu_num, level, champsim::address_slice{pte_table_entry_extent, vaddr}}, champsim::splice(active_pte_page, next_pte_page));
+      page_table.try_emplace({0, level, champsim::address_slice{pte_table_entry_extent, vaddr}}, champsim::splice(active_pte_page, next_pte_page));
 
   // this PTE doesn't yet have a mapping
   if (fault) {

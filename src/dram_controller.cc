@@ -32,10 +32,35 @@
 MEMORY_CONTROLLER::MEMORY_CONTROLLER(champsim::chrono::picoseconds dbus_period, champsim::chrono::picoseconds mc_period, std::size_t t_rp, std::size_t t_rcd,
                                      std::size_t t_cas, std::size_t t_ras, champsim::chrono::microseconds refresh_period, std::vector<channel_type*>&& ul,
                                      std::size_t rq_size, std::size_t wq_size, std::size_t chans, champsim::data::bytes chan_width, std::size_t rows,
-                                     std::size_t columns, std::size_t ranks, std::size_t bankgroups, std::size_t banks, std::size_t refreshes_per_period)
+                                     std::size_t columns, std::size_t ranks, std::size_t bankgroups, std::size_t banks, std::size_t refreshes_per_period,
+                                     double cxl_ratio_in, champsim::chrono::picoseconds cxl_read_penalty_ps,
+                                     champsim::chrono::picoseconds cxl_write_penalty_ps)
     : champsim::operable(mc_period), queues(std::move(ul)), channel_width(chan_width),
-      address_mapping(chan_width, BLOCK_SIZE / chan_width.count(), chans, bankgroups, banks, columns, ranks, rows), data_bus_period(dbus_period)
+      address_mapping(chan_width, BLOCK_SIZE / chan_width.count(), chans, bankgroups, banks, columns, ranks, rows), data_bus_period(dbus_period),
+      cxl_ratio(std::clamp(cxl_ratio_in, 0.0, 1.0)),
+      cxl_read_penalty(std::chrono::duration_cast<champsim::chrono::clock::duration>(cxl_read_penalty_ps)),
+      cxl_write_penalty(std::chrono::duration_cast<champsim::chrono::clock::duration>(cxl_write_penalty_ps)),
+      cxl_boundary(0)
 {
+  if (cxl_read_penalty < champsim::chrono::clock::duration::zero()) {
+    cxl_read_penalty = champsim::chrono::clock::duration::zero();
+  }
+  if (cxl_write_penalty < champsim::chrono::clock::duration::zero()) {
+    cxl_write_penalty = champsim::chrono::clock::duration::zero();
+  }
+
+  const auto total_bytes_ll = size().count();
+  const auto total_bytes = total_bytes_ll > 0 ? static_cast<std::uint64_t>(total_bytes_ll) : std::uint64_t{0};
+  cxl_boundary = total_bytes;
+  if (total_bytes > 0 && cxl_ratio > 0.0) {
+    const auto local_fraction = std::max(0.0, 1.0 - cxl_ratio);
+    cxl_boundary = static_cast<std::uint64_t>(static_cast<double>(total_bytes) * local_fraction);
+    if (BLOCK_SIZE != 0) {
+      const auto block_size = static_cast<std::uint64_t>(BLOCK_SIZE);
+      cxl_boundary -= cxl_boundary % block_size;
+    }
+  }
+
   for (std::size_t i{0}; i < chans; ++i) {
     channels.emplace_back(dbus_period, mc_period, t_rp, t_rcd, t_cas, t_ras, refresh_period, refreshes_per_period, chan_width, rq_size, wq_size,
                           address_mapping);
@@ -354,8 +379,9 @@ long DRAM_CHANNEL::service_packet(DRAM_CHANNEL::queue_type::iterator pkt)
 
       // this bank is now busy
       auto row_charge_delay = champsim::chrono::clock::duration{bank_request[op_idx].open_row.has_value() ? tRP + tRCD : tRCD};
-      bank_request[op_idx] = {true,  row_buffer_hit,        false,
-                              false, std::optional{op_row}, current_time + tCAS + (row_buffer_hit ? champsim::chrono::clock::duration{} : row_charge_delay),
+      auto base_ready = current_time + tCAS + (row_buffer_hit ? champsim::chrono::clock::duration{} : row_charge_delay);
+      bank_request[op_idx] = {true,  row_buffer_hit, false,
+                              false, std::optional{op_row}, base_ready + pkt->value().extra_latency,
                               pkt};
       pkt->value().scheduled = true;
       pkt->value().ready_time = champsim::chrono::clock::time_point::max();
@@ -519,6 +545,7 @@ DRAM_CHANNEL::request_type::request_type(const typename champsim::channel::reque
 bool MEMORY_CONTROLLER::add_rq(const request_type& packet, champsim::channel* ul)
 {
   auto& channel = channels[address_mapping.get_channel(packet.address)];
+  const auto extra_latency = is_cxl_address(packet.address) ? cxl_read_penalty : champsim::chrono::clock::duration::zero();
 
   if (auto rq_it = std::find_if_not(std::begin(channel.RQ), std::end(channel.RQ), [this](const auto& pkt) { return pkt.has_value(); });
       rq_it != std::end(channel.RQ)) {
@@ -526,6 +553,7 @@ bool MEMORY_CONTROLLER::add_rq(const request_type& packet, champsim::channel* ul
     rq_it->value().forward_checked = false;
     rq_it->value().scheduled = false;
     rq_it->value().ready_time = current_time;
+    rq_it->value().extra_latency = extra_latency;
     if (packet.response_requested)
       rq_it->value().to_return = {&ul->returned};
 
@@ -538,6 +566,7 @@ bool MEMORY_CONTROLLER::add_rq(const request_type& packet, champsim::channel* ul
 bool MEMORY_CONTROLLER::add_wq(const request_type& packet)
 {
   auto& channel = channels[address_mapping.get_channel(packet.address)];
+  const auto extra_latency = is_cxl_address(packet.address) ? cxl_write_penalty : champsim::chrono::clock::duration::zero();
 
   // search for the empty index
   if (auto wq_it = std::find_if_not(std::begin(channel.WQ), std::end(channel.WQ), [](const auto& pkt) { return pkt.has_value(); });
@@ -546,6 +575,7 @@ bool MEMORY_CONTROLLER::add_wq(const request_type& packet)
     wq_it->value().forward_checked = false;
     wq_it->value().scheduled = false;
     wq_it->value().ready_time = current_time;
+    wq_it->value().extra_latency = extra_latency;
 
     return true;
   }
@@ -600,6 +630,15 @@ unsigned long DRAM_ADDRESS_MAPPING::get_column(champsim::address address) const
 }
 
 champsim::data::bytes MEMORY_CONTROLLER::size() const { return champsim::data::bytes{(1ll << address_mapping.address_slicer.bit_size())}; }
+
+bool MEMORY_CONTROLLER::is_cxl_address(champsim::address address) const
+{
+  if (cxl_ratio <= 0.0) {
+    return false;
+  }
+
+  return address.to<std::uint64_t>() >= cxl_boundary;
+}
 champsim::data::bytes DRAM_CHANNEL::density() const
 {
   return champsim::data::bytes{(long long)(address_mapping.rows() * address_mapping.columns() * address_mapping.banks() * address_mapping.bankgroups())};
@@ -642,6 +681,10 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(const MEMORY_CONTROLLER& other)
       channel_width(other.channel_width),
       address_mapping(other.address_mapping),
       data_bus_period(other.data_bus_period),
+      cxl_ratio(other.cxl_ratio),
+      cxl_read_penalty(other.cxl_read_penalty),
+      cxl_write_penalty(other.cxl_write_penalty),
+      cxl_boundary(other.cxl_boundary),
       channels(other.channels)
 {
   auto rebind_active = [](const DRAM_CHANNEL& src, DRAM_CHANNEL& dst) {
@@ -666,6 +709,10 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept
       channel_width(other.channel_width),
       address_mapping(other.address_mapping),
       data_bus_period(other.data_bus_period),
+      cxl_ratio(other.cxl_ratio),
+      cxl_read_penalty(other.cxl_read_penalty),
+      cxl_write_penalty(other.cxl_write_penalty),
+      cxl_boundary(other.cxl_boundary),
       channels()
 {
   std::vector<std::optional<std::size_t>> active_offsets;

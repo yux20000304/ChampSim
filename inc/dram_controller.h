@@ -107,6 +107,7 @@ struct DRAM_CHANNEL final : public champsim::operable {
     champsim::address v_address{};
     champsim::address data{};
     champsim::chrono::clock::time_point ready_time = champsim::chrono::clock::time_point::max();
+    champsim::chrono::clock::duration extra_latency{champsim::chrono::clock::duration::zero()};
 
     std::vector<uint64_t> instr_depend_on_me{};
     std::vector<std::deque<response_type>*> to_return{};
@@ -203,13 +204,19 @@ class MEMORY_CONTROLLER : public champsim::operable
   // data bus period
   champsim::chrono::picoseconds data_bus_period{};
 
+  double cxl_ratio{0.0};
+  champsim::chrono::clock::duration cxl_read_penalty{champsim::chrono::clock::duration::zero()};
+  champsim::chrono::clock::duration cxl_write_penalty{champsim::chrono::clock::duration::zero()};
+  std::uint64_t cxl_boundary{std::numeric_limits<std::uint64_t>::max()};
+
 public:
   std::vector<DRAM_CHANNEL> channels;
 
   MEMORY_CONTROLLER(champsim::chrono::picoseconds dbus_period, champsim::chrono::picoseconds mc_period, std::size_t t_rp, std::size_t t_rcd, std::size_t t_cas,
                     std::size_t t_ras, champsim::chrono::microseconds refresh_period, std::vector<channel_type*>&& ul, std::size_t rq_size, std::size_t wq_size,
                     std::size_t chans, champsim::data::bytes chan_width, std::size_t rows, std::size_t columns, std::size_t ranks, std::size_t bankgroups,
-                    std::size_t banks, std::size_t refreshes_per_period);
+                    std::size_t banks, std::size_t refreshes_per_period, double cxl_ratio, champsim::chrono::picoseconds cxl_read_penalty_ps,
+                    champsim::chrono::picoseconds cxl_write_penalty_ps);
   MEMORY_CONTROLLER(const MEMORY_CONTROLLER& other);
   MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept;
 
@@ -220,6 +227,7 @@ public:
   void print_deadlock() final;
 
   [[nodiscard]] champsim::data::bytes size() const;
+  [[nodiscard]] bool is_cxl_address(champsim::address address) const;
 };
 
 #endif

@@ -26,6 +26,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "address.h"
 #include "channel.h"
@@ -208,6 +209,15 @@ class MEMORY_CONTROLLER : public champsim::operable
   champsim::chrono::clock::duration cxl_read_penalty{champsim::chrono::clock::duration::zero()};
   champsim::chrono::clock::duration cxl_write_penalty{champsim::chrono::clock::duration::zero()};
   std::uint64_t cxl_boundary{std::numeric_limits<std::uint64_t>::max()};
+#ifdef ENABLE_CXL_DIRECTORY
+  std::size_t cxl_directory_words_per_entry{0};
+  std::vector<std::uint64_t> cxl_directory{};
+
+  [[nodiscard]] std::size_t cxl_directory_offset(std::size_t page_index) const;
+  [[nodiscard]] std::size_t cxl_directory_index(champsim::address address) const;
+  void initialize_cxl_directory(std::uint64_t total_bytes);
+  champsim::chrono::clock::duration cxl_directory_latency(champsim::address address, std::uint32_t cpu);
+#endif
 
 public:
   std::vector<DRAM_CHANNEL> channels;

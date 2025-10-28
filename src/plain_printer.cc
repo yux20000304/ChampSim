@@ -180,11 +180,21 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
     for (const auto& host_stat : stats.dram_stats) {
       lines.emplace_back("");
       lines.emplace_back(fmt::format("Host {} Simulation DRAM", host_stat.host_name));
-      for (const auto& channel_stat : host_stat.sim_channels) {
-        auto sublines = format(channel_stat);
-        std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
+    for (const auto& channel_stat : host_stat.sim_channels) {
+      auto sublines = format(channel_stat);
+      std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
+    }
+#ifdef ENABLE_CXL_DIRECTORY_CACHE
+    if (!host_stat.sim_directory_cache.empty()) {
+      lines.emplace_back("  Directory Cache");
+      for (const auto& cache_stat : host_stat.sim_directory_cache) {
+        lines.emplace_back(fmt::format("  {} lookups: {:10} hits: {:10} misses: {:10} hit rate: {}",
+                                       cache_stat.name, cache_stat.lookups, cache_stat.hits, cache_stat.misses,
+                                       ::print_ratio(cache_stat.hits, cache_stat.lookups)));
       }
     }
+#endif
+  }
   }
 
   lines.emplace_back("");
@@ -211,6 +221,16 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
       auto sublines = format(channel_stat);
       std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
     }
+#ifdef ENABLE_CXL_DIRECTORY_CACHE
+    if (!host_stat.roi_directory_cache.empty()) {
+      lines.emplace_back("  Directory Cache");
+      for (const auto& cache_stat : host_stat.roi_directory_cache) {
+        lines.emplace_back(fmt::format("  {} lookups: {:10} hits: {:10} misses: {:10} hit rate: {}",
+                                       cache_stat.name, cache_stat.lookups, cache_stat.hits, cache_stat.misses,
+                                       ::print_ratio(cache_stat.hits, cache_stat.lookups)));
+      }
+    }
+#endif
   }
 
   return lines;

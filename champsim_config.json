@@ -40,13 +40,13 @@
   },
 
   "L1I": {
-    "sets": 64,
+    "sets": 128,
     "ways": 8,
     "rq_size": 64,
     "wq_size": 64,
     "pq_size": 32,
     "mshr_size": 8,
-    "latency": 4,
+    "latency": 2,
     "max_tag_check": 2,
     "max_fill": 2,
     "prefetch_as_load": false,
@@ -56,13 +56,13 @@
   },
 
   "L1D": {
-    "sets": 64,
-    "ways": 12,
+    "sets": 128,
+    "ways": 8,
     "rq_size": 64,
     "wq_size": 64,
     "pq_size": 8,
     "mshr_size": 16,
-    "latency": 5,
+    "latency": 2,
     "max_tag_check": 2,
     "max_fill": 2,
     "prefetch_as_load": false,
@@ -72,13 +72,13 @@
   },
 
   "L2C": {
-    "sets": 1024,
-    "ways": 8,
+    "sets": 512,
+    "ways": 16,
     "rq_size": 32,
     "wq_size": 32,
     "pq_size": 16,
     "mshr_size": 32,
-    "latency": 10,
+    "latency": 20,
     "max_tag_check": 1,
     "max_fill": 1,
     "prefetch_as_load": false,
@@ -144,12 +144,12 @@
   "LLC": {
     "frequency": 4000,
     "sets": 2048,
-    "ways": 16,
+    "ways": 32,
     "rq_size": 32,
     "wq_size": 32,
     "pq_size": 32,
     "mshr_size": 64,
-    "latency": 20,
+    "latency": 30,
     "max_tag_check": 1,
     "max_fill": 1,
     "prefetch_as_load": false,
@@ -174,11 +174,12 @@
     "tRCD": 24,
     "tRP": 24,
     "tRAS": 52,
+    "tWR": 0,
     "refresh_period": 32,
     "refreshes_per_period": 8192,
     "cxl_ratio": 0.5,
-    "cxl_read_penalty_ps": 0,
-    "cxl_write_penalty_ps": 0
+    "cxl_round_trip_penalty_ps": 0,
+    "cxl_directory_pages_per_entry": 1
   },
 
   "virtual_memory": {

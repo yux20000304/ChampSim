@@ -47,6 +47,14 @@ struct phase_stats {
     std::string host_name;
     std::vector<DRAM_CHANNEL::stats_type> roi_channels;
     std::vector<DRAM_CHANNEL::stats_type> sim_channels;
+    struct directory_cache_stats {
+      std::string name;
+      std::uint64_t lookups = 0;
+      std::uint64_t hits = 0;
+      std::uint64_t misses = 0;
+    };
+    std::vector<directory_cache_stats> roi_directory_cache;
+    std::vector<directory_cache_stats> sim_directory_cache;
   };
   std::vector<dram_host_stats> dram_stats;
 };

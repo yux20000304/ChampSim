@@ -326,8 +326,10 @@ class SingleHostConfiguration:
         pmem_defaults = {
             'data_rate': 3200, 'frequency': 1600, 'channels': 1, 'ranks': 1, 'bankgroups': 8, 'banks': 4,
             'bank_rows': 65536, 'bank_columns': 1024, 'channel_width': 8, 'wq_size': 64, 'rq_size': 64,
-            'tRP': 24, 'tRCD': 24, 'tCAS': 24, 'tRAS': 52, 'refresh_period': 32, 'refreshes_per_period': 8192,
-            'cxl_ratio': 0.0, 'cxl_read_penalty_ps': 0, 'cxl_write_penalty_ps': 0
+            'tRP': 24, 'tRCD': 24, 'tCAS': 24, 'tRAS': 52, 'tWR': 0, 'refresh_period': 32, 'refreshes_per_period': 8192,
+            'cxl_ratio': 0.0, 'cxl_round_trip_penalty_ps': 0,
+            'cxl_directory_pages_per_entry': 1,
+            'cxl_directory_cache_entries': 0, 'cxl_directory_cache_read_penalty_ps': 0
         }
         pmem = util.chain(self.pmem, pmem_defaults)
         pmem = util.chain(pmem, do_deprecation(pmem, pmem_deprecation_keys, pmem_deprecation_warnings))
@@ -337,7 +339,7 @@ class SingleHostConfiguration:
         except (TypeError, ValueError):
             raise ValueError(f"Invalid cxl_ratio for physical memory '{pmem.get('name', '<unnamed>')}'")
 
-        for key in ('cxl_read_penalty_ps', 'cxl_write_penalty_ps'):
+        for key in ('tWR', 'cxl_round_trip_penalty_ps', 'cxl_directory_pages_per_entry', 'cxl_directory_cache_entries', 'cxl_directory_cache_read_penalty_ps'):
             try:
                 pmem[key] = int(pmem.get(key, 0))
             except (TypeError, ValueError):

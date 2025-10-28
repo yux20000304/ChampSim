@@ -29,7 +29,7 @@
 #include "phase_info.h"
 #include "tracereader.h"
 
-constexpr int DEADLOCK_CYCLE{500};
+constexpr int DEADLOCK_CYCLE{5000};
 
 const auto start_time = std::chrono::steady_clock::now();
 
@@ -183,6 +183,30 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
                    [](const DRAM_CHANNEL& chan) { return chan.sim_stats; });
     std::transform(std::begin(dram.channels), std::end(dram.channels), std::back_inserter(host_stat.roi_channels),
                    [](const DRAM_CHANNEL& chan) { return chan.roi_stats; });
+#ifdef ENABLE_CXL_DIRECTORY_CACHE
+    const auto& cache_names = dram.directory_cache_host_names();
+    const auto& sim_cache_stats = dram.directory_cache_sim_stats();
+    const auto& roi_cache_stats = dram.directory_cache_roi_stats();
+    const auto cache_count = sim_cache_stats.size();
+    host_stat.sim_directory_cache.reserve(cache_count);
+    for (std::size_t cache_idx = 0; cache_idx < cache_count; ++cache_idx) {
+      phase_stats::dram_host_stats::directory_cache_stats cache_stat;
+      cache_stat.name = cache_idx < cache_names.size() ? cache_names[cache_idx] : fmt::format("host{}", cache_idx);
+      cache_stat.lookups = sim_cache_stats[cache_idx].lookups;
+      cache_stat.hits = sim_cache_stats[cache_idx].hits;
+      cache_stat.misses = sim_cache_stats[cache_idx].misses;
+      host_stat.sim_directory_cache.push_back(cache_stat);
+    }
+    host_stat.roi_directory_cache.reserve(roi_cache_stats.size());
+    for (std::size_t cache_idx = 0; cache_idx < roi_cache_stats.size(); ++cache_idx) {
+      phase_stats::dram_host_stats::directory_cache_stats cache_stat;
+      cache_stat.name = cache_idx < cache_names.size() ? cache_names[cache_idx] : fmt::format("host{}", cache_idx);
+      cache_stat.lookups = roi_cache_stats[cache_idx].lookups;
+      cache_stat.hits = roi_cache_stats[cache_idx].hits;
+      cache_stat.misses = roi_cache_stats[cache_idx].misses;
+      host_stat.roi_directory_cache.push_back(cache_stat);
+    }
+#endif
     stats.dram_stats.push_back(std::move(host_stat));
   }
 

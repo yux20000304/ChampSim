@@ -53,6 +53,7 @@ struct ThreadData {
   ADDRINT stack_start;
   ADDRINT stack_end;
   BOOL inROI;
+  BOOL should_write;
 };
 
 /* ================================================================== */
@@ -147,6 +148,7 @@ VOID ThreadStart(THREADID threadid, CONTEXT* ctxt, INT32 flags, VOID* v)
   thread_data[threadid]->stack_start = stack_start;
   thread_data[threadid]->stack_end = stack_end;
   thread_data[threadid]->instrCount = 0;
+  thread_data[threadid]->should_write = FALSE;
 
   std::cout << "Thread " << threadid << " started. Dump file: " << ss.str() << " stack start: " << (void*)(thread_data[threadid]->stack_start)
             << " stack end: " << (void*)(thread_data[threadid]->stack_end) << std::endl;
@@ -189,7 +191,7 @@ VOID ThreadFini(THREADID threadid, const CONTEXT* ctxt, INT32 code, VOID* v)
               << " footprint line size: " << tdata->footprint_line_set.size() << " footprint page size: " << tdata->footprint_page_set.size() << std::endl;
     std::cout.flush();
     delete tdata;
-    tdata = NULL;
+    thread_data[threadid] = NULL;
   }
 }
 
@@ -197,31 +199,26 @@ VOID ThreadFini(THREADID threadid, const CONTEXT* ctxt, INT32 code, VOID* v)
 // Analysis routines
 /* ===================================================================== */
 
-void ResetCurrentInstruction(VOID* ip, THREADID tid)
-{
-  ThreadData* tdata = thread_data[tid];
-  if (tdata && tdata->inROI) {
-    tdata->curr_instr = {};
-    tdata->curr_instr.ip = reinterpret_cast<unsigned long long>(ip);
-  }
-}
-
-BOOL ShouldWrite(THREADID tid)
+VOID BeginInstruction(VOID* ip, THREADID tid)
 {
   ThreadData* tdata = thread_data[tid];
   if (!(tdata != NULL && tid < MAX_THREADS && tid >= 0)) {
     std::cout << "pin_magic_inst: tdata is NULL or tid is out of range" << std::endl;
     std::cout.flush();
     exit(1);
-    return FALSE;
+    return;
   }
-  if (tdata && tdata->inROI) {
+  tdata->should_write = FALSE;
+  if (tdata->inROI) {
     tdata->instrCount++;
-    // std::cout << "Thread " << tid << " instruction count: " << tdata->instrCount << std::endl;
-    // return (tdata->instrCount > KnobSkipInstructions.Value()) && (tdata->instrCount <= (KnobTraceInstructions.Value() + KnobSkipInstructions.Value()));
-    return tdata->inROI;
+    BOOL in_window = (tdata->instrCount > KnobSkipInstructions.Value()) &&
+                     (tdata->instrCount <= (KnobTraceInstructions.Value() + KnobSkipInstructions.Value()));
+    if (in_window) {
+      tdata->should_write = TRUE;
+      tdata->curr_instr = {};
+      tdata->curr_instr.ip = reinterpret_cast<unsigned long long>(ip);
+    }
   }
-  return FALSE;
 }
 
 /* ===================================================================== */
@@ -265,9 +262,8 @@ void ProcessInstructionOperands(VOID* ip, THREADID tid, BOOL taken, BOOL is_bran
     exit(1);
     return;
   }
-  // reset
-  tdata->curr_instr = {};
-  tdata->curr_instr.ip = reinterpret_cast<unsigned long long>(ip);
+  if (!tdata->should_write)
+    return;
 
   // branch
   if (is_branch) {
@@ -306,18 +302,19 @@ void ProcessInstructionOperands(VOID* ip, THREADID tid, BOOL taken, BOOL is_bran
   // std::cout << "Thread " << tid << " writing instruction to file" << buf[1] << std::endl;
   // std::cout.flush();
   if (!tdata->outfile) {
-    std::cout << "pin_magic_inst: tdata is NULL or tid is out of range" << std::endl;
+    std::cout << "ProcessInstructionOperands: tdata->outfile is NULL for tid " << tid << ". This should not happen inside an ROI." << std::endl;
     std::cout.flush();
     exit(1);
     return;
   }
   tdata->outfile->write(buf, sizeof(trace_instr_format_t));
+  tdata->should_write = FALSE;
 }
 
 VOID WriteToSourceMemory(THREADID tid, UINT32 memOp, ADDRINT memEA)
 {
   ThreadData* tdata = thread_data[tid];
-  if (tdata && tdata->inROI) {
+  if (tdata && tdata->should_write) {
     unsigned long long int* begin = tdata->curr_instr.source_memory;
     unsigned long long int* end = tdata->curr_instr.source_memory + NUM_INSTR_SOURCES;
     auto set_end = std::find(begin, end, 0);
@@ -335,7 +332,7 @@ VOID WriteToSourceMemory(THREADID tid, UINT32 memOp, ADDRINT memEA)
 VOID WriteToDestinationMemory(THREADID tid, UINT32 memOp, ADDRINT memEA)
 {
   ThreadData* tdata = thread_data[tid];
-  if (tdata && tdata->inROI) {
+  if (tdata && tdata->should_write) {
     unsigned long long int* begin = tdata->curr_instr.destination_memory;
     unsigned long long int* end = tdata->curr_instr.destination_memory + NUM_INSTR_DESTINATIONS;
     auto set_end = std::find(begin, end, 0);
@@ -353,7 +350,7 @@ VOID WriteToDestinationMemory(THREADID tid, UINT32 memOp, ADDRINT memEA)
 VOID WriteToSourceRegister(THREADID tid, UINT32 regNum)
 {
   ThreadData* tdata = thread_data[tid];
-  if (tdata && tdata->inROI) {
+  if (tdata && tdata->should_write) {
     unsigned char* begin = tdata->curr_instr.source_registers;
     unsigned char* end = tdata->curr_instr.source_registers + NUM_INSTR_SOURCES;
     auto set_end = std::find(begin, end, 0);
@@ -367,7 +364,7 @@ VOID WriteToSourceRegister(THREADID tid, UINT32 regNum)
 VOID WriteToDestinationRegister(THREADID tid, UINT32 regNum)
 {
   ThreadData* tdata = thread_data[tid];
-  if (tdata && tdata->inROI) {
+  if (tdata && tdata->should_write) {
     unsigned char* begin = tdata->curr_instr.destination_registers;
     unsigned char* end = tdata->curr_instr.destination_registers + NUM_INSTR_DESTINATIONS;
     auto set_end = std::find(begin, end, 0);
@@ -386,6 +383,8 @@ VOID Instruction(INS ins, VOID* v)
     std::cout.flush();
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)pin_magic_inst, IARG_THREAD_ID, IARG_REG_VALUE, REG_RBX, IARG_REG_VALUE, REG_RCX, IARG_END);
   }
+
+  INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)BeginInstruction, IARG_INST_PTR, IARG_THREAD_ID, IARG_END);
 
   UINT32 readRegCount = INS_MaxNumRRegs(ins);
   for (UINT32 i = 0; i < readRegCount; i++) {
@@ -413,8 +412,7 @@ VOID Instruction(INS ins, VOID* v)
 
   BOOL is_branch = INS_IsBranch(ins);
 
-  INS_InsertIfCall(ins, IPOINT_BEFORE, (AFUNPTR)ShouldWrite, IARG_THREAD_ID, IARG_END);
-  INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)ProcessInstructionOperands, IARG_INST_PTR, IARG_THREAD_ID, IARG_BRANCH_TAKEN, IARG_BOOL, is_branch, IARG_END);
+  INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)ProcessInstructionOperands, IARG_INST_PTR, IARG_THREAD_ID, IARG_BRANCH_TAKEN, IARG_BOOL, is_branch, IARG_END);
 }
 
 /*!

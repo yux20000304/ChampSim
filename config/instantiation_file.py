@@ -22,7 +22,7 @@ import multiprocessing as mp
 from . import util
 from . import cxx
 
-pmem_fmtstr = 'champsim::chrono::picoseconds{{{clock_period_dbus}}}, champsim::chrono::picoseconds{{{clock_period_mc}}}, std::size_t{{{_tRP}}}, std::size_t{{{_tRCD}}}, std::size_t{{{_tCAS}}}, std::size_t{{{_tRAS}}}, champsim::chrono::microseconds{{{_refresh_period}}}, {{{_ulptr}}}, {rq_size}, {wq_size}, {channels}, champsim::data::bytes{{{channel_width}}}, {_bank_rows}, {_bank_columns}, {ranks}, {bankgroups}, {banks}, {_refreshes_per_period}, double{{{cxl_ratio}}}, champsim::chrono::picoseconds{{{cxl_read_penalty_ps}}}, champsim::chrono::picoseconds{{{cxl_write_penalty_ps}}}'
+pmem_fmtstr = 'champsim::chrono::picoseconds{{{clock_period_dbus}}}, champsim::chrono::picoseconds{{{clock_period_mc}}}, std::size_t{{{_tRP}}}, std::size_t{{{_tRCD}}}, std::size_t{{{_tCAS}}}, std::size_t{{{_tRAS}}}, std::size_t{{{_tWR}}}, champsim::chrono::microseconds{{{_refresh_period}}}, {{{_ulptr}}}, {rq_size}, {wq_size}, {channels}, champsim::data::bytes{{{channel_width}}}, {_bank_rows}, {_bank_columns}, {ranks}, {bankgroups}, {banks}, {_refreshes_per_period}, double{{{cxl_ratio}}}, champsim::chrono::picoseconds{{{cxl_round_trip_penalty_ps}}}, std::size_t{{{cxl_directory_pages_per_entry}}}'
 vmem_fmtstr = 'champsim::data::bytes{{{pte_page_size}}}, {num_levels}, champsim::chrono::picoseconds{{{clock_period}*{minor_fault_penalty}}}, {dram_name}, {_randomization}'
 
 queue_fmtstr = '{rq_size}, {pq_size}, {wq_size}, champsim::data::bits{{{_offset_bits}}}, {_queue_check_full_addr:b}'
@@ -345,7 +345,7 @@ def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build
 
     dram_inits = []
     for pmem in pmems:
-        pmem_format_args = {k: v for k, v in pmem.items() if k not in ('cxl_ratio', 'cxl_read_penalty_ps', 'cxl_write_penalty_ps')}
+        pmem_format_args = {k: v for k, v in pmem.items() if k not in ('cxl_ratio', 'cxl_round_trip_penalty_ps', 'cxl_directory_pages_per_entry', 'tWR')}
         dram_body = pmem_fmtstr.format(
             clock_period_dbus=int(1000000/pmem['data_rate']),
             clock_period_mc=int(1000000/pmem['frequency']),
@@ -353,14 +353,15 @@ def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build
             _tRCD=int(pmem['tRCD']),
             _tCAS=int(pmem['tCAS']),
             _tRAS=int(pmem['tRAS']),
+            _tWR=int(pmem.get('tWR', 0)),
             _bank_rows=int(pmem['bank_rows']),
             _bank_columns=int(pmem['columns']*8 if 'columns' in pmem else pmem['bank_columns']),
             _refresh_period=int(1000*pmem['refresh_period']),
             _refreshes_per_period=int(pmem['refreshes_per_period']),
             _ulptr=vector_string(f'&channels.at({ul_pairs.index(v)})' for v in ul_pairs if v[0] == pmem['name']),
             cxl_ratio=pmem['cxl_ratio'],
-            cxl_read_penalty_ps=int(pmem['cxl_read_penalty_ps']),
-            cxl_write_penalty_ps=int(pmem['cxl_write_penalty_ps']),
+            cxl_round_trip_penalty_ps=int(pmem['cxl_round_trip_penalty_ps']),
+            cxl_directory_pages_per_entry=int(pmem.get('cxl_directory_pages_per_entry', 1)),
             **pmem_format_args
         )
         dram_inits.append(f'MEMORY_CONTROLLER{{{dram_body}}}')
@@ -390,6 +391,39 @@ def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build
     vmems_instantiation_body.append('},')
 
     host_records = hosts or tuple({'name': f'host{idx}'} for idx in range(len(pmems)))
+    total_cores = len(cores)
+
+    if hosts:
+        host_cpu_indices = [tuple(host.get('core_indices', ())) for host in host_records]
+    else:
+        host_cpu_indices = []
+        offset = 0
+        remaining_hosts = len(host_records)
+        for _ in host_records:
+            remaining_cores = max(total_cores - offset, 0)
+            share = remaining_cores // max(remaining_hosts, 1)
+            if remaining_hosts == 1:
+                share = remaining_cores
+            host_cpu_indices.append(tuple(range(offset, offset + share)))
+            offset += share
+            remaining_hosts -= 1
+
+    if not any(host_cpu_indices) and total_cores:
+        host_cpu_indices = [tuple(range(total_cores))]
+    def make_host_cpu_literal():
+        if not host_cpu_indices:
+            return 'std::vector<std::vector<std::uint32_t>>{}'
+        inner = ', '.join(
+            f'std::vector<std::uint32_t>{{{", ".join(str(idx) for idx in host)}}}' if host else 'std::vector<std::uint32_t>{}'
+            for host in host_cpu_indices
+        )
+        return f'std::vector<std::vector<std::uint32_t>>{{{inner}}}'
+
+    def make_host_name_literal():
+        if not host_label_inits:
+            return 'std::vector<std::string>{}'
+        return f'std::vector<std::string>{{{", ".join(host_label_inits)}}}'
+
     host_label_inits = [f'"{host["name"]}"' for host in host_records]
     host_labels_instantiation_body = ['host_labels{']
     if host_label_inits:
@@ -426,7 +460,28 @@ def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build
     yield from ptw_instantiation_body
     yield from cache_instantiation_body
     yield from core_instantiation_body
+
+    constructor_body_lines = []
+    if pmems:
+        host_cpu_literal = make_host_cpu_literal()
+        host_name_literal = make_host_name_literal()
+        for idx, pmem in enumerate(pmems):
+            constructor_body_lines.extend([
+                '#ifdef ENABLE_CXL_DIRECTORY_CACHE',
+                f'drams.at({idx}).configure_cxl_cache(',
+                f'    {host_cpu_literal},',
+                f'    {host_name_literal},',
+                f'    std::size_t{{{pmem.get("cxl_directory_cache_entries", 0)}}},',
+                f'    champsim::chrono::picoseconds{{{pmem.get("cxl_directory_cache_read_penalty_ps", 0)}}});',
+                '#endif'
+            ])
+
     yield '{'
+    for line in constructor_body_lines:
+        if line.startswith('#'):
+            yield line
+        else:
+            yield '  '+line
     yield '}'
     yield ''
 

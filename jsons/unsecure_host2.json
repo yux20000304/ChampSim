@@ -1,5 +1,5 @@
 {
-  "executable_name": "champsim_multi_host_sec_dcxl",
+  "executable_name": "unsecure_host2",
   "block_size": 64,
   "page_size": 4096,
   "heartbeat_frequency": 10000000,
@@ -151,10 +151,10 @@
   "physical_memory": {
     "name": "shared_dram",
     "data_rate": 6400,
-    "channels": 1,
+    "channels": 2,
     "ranks": 1,
     "bankgroups": 8,
-    "banks": 8,
+    "banks": 4,
     "bank_rows": 65536,
     "bank_columns": 1024,
     "channel_width": 8,
@@ -168,8 +168,8 @@
     "refresh_period": 32,
     "refreshes_per_period": 8192,
     "cxl_ratio": 1,
-    "cxl_round_trip_penalty_ps": 85000,
-    "cxl_directory_pages_per_entry": 65536,
+    "cxl_round_trip_penalty_ps": 70000,
+    "cxl_directory_pages_per_entry": 1,
     "cxl_directory_cache_entries": 32,
     "cxl_directory_cache_read_penalty_ps": 2000,
     "cxl_directory_cache_max_requests_per_cycle": 32
@@ -187,14 +187,6 @@
     },
     {
       "name": "host1",
-      "num_cores": 1
-    },
-    {
-      "name": "host2",
-      "num_cores": 1
-    },
-    {
-      "name": "host3",
       "num_cores": 1
     }
   ]

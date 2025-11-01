@@ -36,7 +36,9 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(champsim::chrono::picoseconds dbus_period, 
                                      std::size_t wq_size, std::size_t chans, champsim::data::bytes chan_width, std::size_t rows,
                                      std::size_t columns, std::size_t ranks, std::size_t bankgroups, std::size_t banks,
                                      std::size_t refreshes_per_period, double cxl_ratio_in,
-                                     champsim::chrono::picoseconds cxl_round_trip_penalty_ps, std::size_t cxl_directory_pages_per_entry_in)
+                                     champsim::chrono::picoseconds cxl_round_trip_penalty_ps, std::size_t cxl_directory_pages_per_entry_in,
+                                     std::size_t cxl_directory_cache_entries, champsim::chrono::picoseconds cxl_directory_cache_read_penalty_ps,
+                                     std::size_t cxl_directory_cache_max_requests_per_cycle)
     : champsim::operable(mc_period), queues(std::move(ul)), channel_width(chan_width),
       address_mapping(chan_width, BLOCK_SIZE / chan_width.count(), chans, bankgroups, banks, columns, ranks, rows), data_bus_period(dbus_period),
       cxl_ratio(std::clamp(cxl_ratio_in, 0.0, 1.0)),
@@ -45,6 +47,12 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(champsim::chrono::picoseconds dbus_period, 
 {
 #ifdef ENABLE_CXL_DIRECTORY
   cxl_directory_pages_per_entry = std::max<std::size_t>(1, cxl_directory_pages_per_entry_in);
+#ifndef ENABLE_CXL_DIRECTORY_CACHE
+  shared_directory_cache.capacity = cxl_directory_cache_entries;
+  shared_directory_cache.words_per_entry = std::max<std::size_t>(1, (NUM_CPUS + 63) / 64);
+  shared_directory_cache.read_penalty = std::chrono::duration_cast<champsim::chrono::clock::duration>(cxl_directory_cache_read_penalty_ps);
+  shared_directory_cache.max_requests_per_cycle = cxl_directory_cache_max_requests_per_cycle;
+#endif
 #else
   (void)cxl_directory_pages_per_entry_in;
 #endif
@@ -91,6 +99,16 @@ DRAM_CHANNEL::DRAM_CHANNEL(champsim::chrono::picoseconds dbus_period, champsim::
   request_array_type br(address_mapping.ranks() * address_mapping.banks() * address_mapping.bankgroups());
   bank_request = br;
   active_request = std::end(bank_request);
+}
+
+champsim::chrono::clock::duration DRAM_CHANNEL::read_latency_closed_row() const
+{
+  return std::max(tRAS, tRCD + tCAS) + tRP;
+}
+
+champsim::chrono::clock::duration DRAM_CHANNEL::write_latency_closed_row() const
+{
+  return std::max(tRAS, tRCD + tWR) + tRP;
 }
 
 DRAM_ADDRESS_MAPPING::DRAM_ADDRESS_MAPPING(champsim::data::bytes channel_width_, std::size_t pref_size_, std::size_t channels_, std::size_t bankgroups_,
@@ -386,7 +404,9 @@ long DRAM_CHANNEL::service_packet(DRAM_CHANNEL::queue_type::iterator pkt)
 
       // this bank is now busy
       auto row_charge_delay = champsim::chrono::clock::duration{bank_request[op_idx].open_row.has_value() ? tRP + tRCD : tRCD};
-      auto base_ready = current_time + tCAS + (row_buffer_hit ? champsim::chrono::clock::duration{} : row_charge_delay);
+      const bool is_write = pkt->value().type == access_type::WRITE;
+      auto column_access_delay = is_write ? tWR : tCAS;
+      auto base_ready = current_time + column_access_delay + (row_buffer_hit ? champsim::chrono::clock::duration{} : row_charge_delay);
       bank_request[op_idx] = {true,  row_buffer_hit, false,
                               false, std::optional{op_row}, base_ready + pkt->value().extra_latency,
                               pkt};
@@ -436,13 +456,20 @@ void MEMORY_CONTROLLER::begin_phase()
     ul->roi_stats = ul_new_roi_stats;
     ul->sim_stats = ul_new_sim_stats;
   }
-#ifdef ENABLE_CXL_DIRECTORY_CACHE
+#if defined(ENABLE_CXL_DIRECTORY_CACHE)
   for (auto& stats : host_cache_sim_stats) {
     stats = {};
   }
   for (auto& stats : host_cache_roi_stats) {
     stats = {};
   }
+#elif defined(ENABLE_CXL_DIRECTORY)
+  shared_cache_sim_lookups = 0;
+  shared_cache_sim_hits = 0;
+  shared_cache_sim_misses = 0;
+#endif
+#ifdef ENABLE_CXL_DIRECTORY
+  directory_latency_sim_stats = {};
 #endif
 }
 
@@ -453,8 +480,15 @@ void MEMORY_CONTROLLER::end_phase(unsigned cpu)
   for (auto& chan : channels) {
     chan.end_phase(cpu);
   }
-#ifdef ENABLE_CXL_DIRECTORY_CACHE
+#if defined(ENABLE_CXL_DIRECTORY_CACHE)
   host_cache_roi_stats = host_cache_sim_stats;
+#elif defined(ENABLE_CXL_DIRECTORY)
+  shared_cache_roi_lookups = shared_cache_sim_lookups;
+  shared_cache_roi_hits = shared_cache_sim_hits;
+  shared_cache_roi_misses = shared_cache_sim_misses;
+#endif
+#ifdef ENABLE_CXL_DIRECTORY
+  directory_latency_roi_stats = directory_latency_sim_stats;
 #endif
 }
 
@@ -566,6 +600,9 @@ void MEMORY_CONTROLLER::initialize_cxl_directory(std::uint64_t total_bytes)
   cxl_directory.assign(total_words, 0);
 #ifdef ENABLE_CXL_DIRECTORY_CACHE
   cxl_cache_clear();
+#else
+  shared_directory_cache.clear();
+  shared_directory_cache.words_per_entry = cxl_directory_words_per_entry;
 #endif
 }
 
@@ -625,7 +662,8 @@ std::vector<std::uint64_t>* MEMORY_CONTROLLER::cxl_cache_insert_entry(std::size_
 }
 
 void MEMORY_CONTROLLER::configure_cxl_cache(std::vector<std::vector<std::uint32_t>> host_cpu_ids, std::vector<std::string> host_names,
-                                            std::size_t cache_entries, champsim::chrono::picoseconds cache_read_penalty_ps)
+                                            std::size_t cache_entries, champsim::chrono::picoseconds cache_read_penalty_ps,
+                                            std::size_t cache_max_requests_per_cycle)
 {
   cxl_host_cpu_ids = std::move(host_cpu_ids);
   cxl_host_names = std::move(host_names);
@@ -643,6 +681,7 @@ void MEMORY_CONTROLLER::configure_cxl_cache(std::vector<std::vector<std::uint32_
     const auto cpu_count = cxl_host_cpu_ids[host_idx].size();
     cache.words_per_entry = cpu_count == 0 ? 0 : ((cpu_count + 63) / 64);
     cache.read_penalty = read_penalty;
+    cache.max_requests_per_cycle = cache_max_requests_per_cycle;
     cxl_host_caches.push_back(std::move(cache));
 
     const auto& host_cpu_list = cxl_host_cpu_ids[host_idx];
@@ -691,55 +730,53 @@ champsim::chrono::clock::duration MEMORY_CONTROLLER::cxl_directory_latency(champ
     return champsim::chrono::clock::duration::zero();
   }
 
-  const auto dram_read_latency = [this, address]() {
-    if (channels.empty()) {
-      return champsim::chrono::clock::duration::zero();
-    }
+  champsim::chrono::clock::duration dram_read_latency{};
+  if (!channels.empty()) {
     const auto channel_idx = static_cast<std::size_t>(
         std::min<std::uint64_t>(address_mapping.get_channel(address), static_cast<std::uint64_t>(channels.size() - 1)));
-    return channels.at(channel_idx).tCAS;
-  }();
-
-  auto base_latency = dram_read_latency + cxl_round_trip_penalty;
+    const auto& channel = channels.at(channel_idx);
+    dram_read_latency = channel.read_latency_closed_row();
+  }
 
   if (cxl_directory.empty() || cxl_directory_words_per_entry == 0) {
-    return base_latency;
+    return dram_read_latency;
   }
 
   const auto page_index = cxl_directory_index(address);
   const auto base = cxl_directory_offset(page_index);
   if (base >= cxl_directory.size()) {
-    return base_latency;
+    return dram_read_latency;
   }
 
   const bool cpu_known = cpu != std::numeric_limits<std::uint32_t>::max();
   if (!cpu_known) {
-    return base_latency;
+    return dram_read_latency;
   }
 
   const auto cpu_index = static_cast<std::size_t>(cpu);
   if (cpu_index >= NUM_CPUS) {
-    return base_latency;
+    return dram_read_latency;
   }
 
   const auto word_index = cpu_index / 64;
   const auto bit_index = cpu_index % 64;
   const auto offset = base + word_index;
   if (offset >= cxl_directory.size()) {
-    return base_latency;
+    return dram_read_latency;
   }
 
   auto& entry = cxl_directory[offset];
   const auto mask = std::uint64_t{1} << bit_index;
   const bool has_permission = (entry & mask) != 0;
 
-#ifdef ENABLE_CXL_DIRECTORY_CACHE
   std::vector<std::uint64_t>* cache_words = nullptr;
-  std::size_t local_word_index = 0;
-  std::uint64_t local_mask = 0;
+  std::size_t cache_word_index = word_index;
+  std::uint64_t cache_mask = mask;
   bool cache_hit = false;
-  champsim::chrono::clock::duration cache_hit_latency{};
+  bool cache_serviced = false;
+  champsim::chrono::clock::duration cache_latency{};
 
+#ifdef ENABLE_CXL_DIRECTORY_CACHE
   if (cpu_index < cpu_to_host.size()) {
     const auto host_id = cpu_to_host[cpu_index];
     if (host_id != cxl_invalid_host_id && host_id < cxl_host_caches.size()) {
@@ -747,18 +784,28 @@ champsim::chrono::clock::duration MEMORY_CONTROLLER::cxl_directory_latency(champ
       if (local_idx != cxl_invalid_host_id) {
         auto& cache = cxl_host_caches[host_id];
         if (cache.enabled()) {
+          cache_serviced = true;
+          cache_word_index = local_idx / 64;
+          cache_mask = std::uint64_t{1} << (local_idx % 64);
+
           cxl_cache_stats* sim_stats_ptr =
               host_id < host_cache_sim_stats.size() ? &host_cache_sim_stats[host_id] : nullptr;
           if (sim_stats_ptr != nullptr) {
             sim_stats_ptr->lookups++;
           }
 
-          local_word_index = local_idx / 64;
-          local_mask = std::uint64_t{1} << (local_idx % 64);
+          auto service_time = cache.read_penalty;
+          if (service_time <= champsim::chrono::clock::duration::zero()) {
+            service_time = std::chrono::duration_cast<champsim::chrono::clock::duration>(clock_period);
+            if (service_time <= champsim::chrono::clock::duration::zero()) {
+              service_time = champsim::chrono::clock::duration{1};
+            }
+          }
+          const auto wait_time = cache.enforce_bandwidth(current_time, service_time);
+          cache_latency = cache.read_penalty + wait_time;
 
           cache_words = cxl_cache_find_entry(host_id, page_index);
           cache_hit = (cache_words != nullptr);
-          cache_hit_latency = cache.read_penalty;
 
           if (cache_hit) {
             if (sim_stats_ptr != nullptr) {
@@ -782,7 +829,10 @@ champsim::chrono::clock::duration MEMORY_CONTROLLER::cxl_directory_latency(champ
                 const auto dir_offset = base + gw_index;
                 if (dir_offset < cxl_directory.size() &&
                     (cxl_directory[dir_offset] & (std::uint64_t{1} << gb_index))) {
-                  words[i / 64] |= std::uint64_t{1} << (i % 64);
+                  const auto local_word = i / 64;
+                  if (local_word < words.size()) {
+                    words[local_word] |= std::uint64_t{1} << (i % 64);
+                  }
                 }
               }
             }
@@ -792,34 +842,102 @@ champsim::chrono::clock::duration MEMORY_CONTROLLER::cxl_directory_latency(champ
       }
     }
   }
+#else
+  if (shared_directory_cache.enabled()) {
+    cache_serviced = true;
 
-  if (cache_hit && has_permission) {
-    base_latency = cache_hit_latency;
+    auto service_time = shared_directory_cache.read_penalty;
+    if (service_time <= champsim::chrono::clock::duration::zero()) {
+      service_time = std::chrono::duration_cast<champsim::chrono::clock::duration>(clock_period);
+      if (service_time <= champsim::chrono::clock::duration::zero()) {
+        service_time = champsim::chrono::clock::duration{1};
+      }
+    }
+    const auto wait_time = shared_directory_cache.enforce_bandwidth(current_time, service_time);
+    cache_latency = shared_directory_cache.read_penalty + wait_time;
+
+    cache_words = shared_directory_cache.find_entry(page_index);
+    cache_hit = (cache_words != nullptr);
+    shared_cache_sim_lookups++;
+    if (cache_hit) {
+      shared_cache_sim_hits++;
+    } else {
+      shared_cache_sim_misses++;
+    }
+
+    if (!cache_hit) {
+      const auto words_to_copy = std::min(shared_directory_cache.words_per_entry, cxl_directory_words_per_entry);
+      std::vector<std::uint64_t> words(shared_directory_cache.words_per_entry, std::uint64_t{0});
+      for (std::size_t i = 0; i < words_to_copy; ++i) {
+        const auto dir_offset = base + i;
+        if (dir_offset < cxl_directory.size()) {
+          words[i] = cxl_directory[dir_offset];
+        }
+      }
+      cache_words = shared_directory_cache.insert_entry(page_index, std::move(words));
+    }
   }
+#endif
+  champsim::chrono::clock::duration directory_latency{};
+  champsim::chrono::clock::duration cache_component{champsim::chrono::clock::duration::zero()};
+  champsim::chrono::clock::duration dram_component{champsim::chrono::clock::duration::zero()};
+  if (cache_serviced) {
+    cache_component = cache_latency;
+    directory_latency += cache_component;
+    if (!cache_hit) {
+      dram_component = dram_read_latency;
+      directory_latency += dram_component;
+    }
+  } else {
+    dram_component = dram_read_latency;
+    directory_latency += dram_component;
+  }
+
+#ifdef ENABLE_CXL_DIRECTORY
+  directory_latency_sim_stats.total += directory_latency;
+  directory_latency_sim_stats.cache += cache_component;
+  directory_latency_sim_stats.dram += dram_component;
 #endif
 
   if (has_permission) {
-#ifdef ENABLE_CXL_DIRECTORY_CACHE
-    if (cache_words != nullptr && local_mask != 0 && local_word_index < cache_words->size()) {
-      (*cache_words)[local_word_index] |= local_mask;
+    if (cache_words != nullptr && cache_mask != 0 && cache_word_index < cache_words->size()) {
+      (*cache_words)[cache_word_index] |= cache_mask;
     }
-#endif
-    return base_latency;
+    return directory_latency;
   }
 
   entry |= mask;
-#ifdef ENABLE_CXL_DIRECTORY_CACHE
-  if (cache_words != nullptr && local_mask != 0 && local_word_index < cache_words->size()) {
-    (*cache_words)[local_word_index] |= local_mask;
+  if (cache_words != nullptr && cache_mask != 0 && cache_word_index < cache_words->size()) {
+    (*cache_words)[cache_word_index] |= cache_mask;
   }
-#endif
-
-  return base_latency;
+  return directory_latency;
 }
 #endif
 
+void MEMORY_CONTROLLER::bind_host_channels(std::vector<std::vector<std::uint32_t>> host_cpu_ids)
+{
+  cpu_channel_map.assign(NUM_CPUS, invalid_channel_index);
+
+  if (channels.empty()) {
+    return;
+  }
+
+  const auto channel_count = channels.size();
+  for (std::size_t host_idx = 0; host_idx < host_cpu_ids.size(); ++host_idx) {
+    const auto channel_idx = channel_count == 0 ? std::size_t{0} : (host_idx % channel_count);
+    for (auto cpu_id : host_cpu_ids[host_idx]) {
+      if (cpu_id >= cpu_channel_map.size()) {
+        cpu_channel_map.resize(static_cast<std::size_t>(cpu_id) + 1, invalid_channel_index);
+      }
+      cpu_channel_map[cpu_id] = channel_idx;
+    }
+  }
+}
+
 void MEMORY_CONTROLLER::initiate_requests()
 {
+  process_pending_requests();
+
   // Initiate read requests
   for (auto* ul : queues) {
     for (auto q : {std::ref(ul->RQ), std::ref(ul->PQ)}) {
@@ -838,26 +956,81 @@ DRAM_CHANNEL::request_type::request_type(const typename champsim::channel::reque
 {
   asid[0] = req.asid[0];
   asid[1] = req.asid[1];
+  type = req.type;
 }
 
 bool MEMORY_CONTROLLER::add_rq(const request_type& packet, champsim::channel* ul)
 {
-  auto& channel = channels[address_mapping.get_channel(packet.address)];
 #ifdef ENABLE_CXL_DIRECTORY
-  const auto extra_latency = cxl_directory_latency(packet.address, packet.cpu) + (is_cxl_address(packet.address) ? cxl_round_trip_penalty : champsim::chrono::clock::duration::zero());
+  const auto extra_latency =
+      cxl_directory_latency(packet.address, packet.cpu) + (is_cxl_address(packet.address) ? cxl_round_trip_penalty : champsim::chrono::clock::duration::zero());
+#else
+  const auto extra_latency =
+      is_cxl_address(packet.address) ? cxl_round_trip_penalty : champsim::chrono::clock::duration::zero();
+#endif
+  if (extra_latency > champsim::chrono::clock::duration::zero()) {
+    pending_requests.push_back(delayed_request{packet, ul, false, current_time + extra_latency, champsim::chrono::clock::duration::zero()});
+    return true;
+  }
+
+  return enqueue_read_request(packet, ul, extra_latency);
+}
+
+bool MEMORY_CONTROLLER::add_wq(const request_type& packet)
+{
+#ifdef ENABLE_CXL_DIRECTORY
+  const auto extra_latency =
+      cxl_directory_latency(packet.address, packet.cpu) + (is_cxl_address(packet.address) ? cxl_round_trip_penalty : champsim::chrono::clock::duration::zero());
 #else
   const auto extra_latency =
       is_cxl_address(packet.address) ? cxl_round_trip_penalty : champsim::chrono::clock::duration::zero();
 #endif
 
-  if (auto rq_it = std::find_if_not(std::begin(channel.RQ), std::end(channel.RQ), [this](const auto& pkt) { return pkt.has_value(); });
+  // search for the empty index
+  if (extra_latency > champsim::chrono::clock::duration::zero()) {
+    pending_requests.push_back(delayed_request{packet, nullptr, true, current_time + extra_latency, champsim::chrono::clock::duration::zero()});
+    return true;
+  }
+
+  return enqueue_write_request(packet, extra_latency);
+}
+
+std::size_t MEMORY_CONTROLLER::select_channel(const request_type& packet) const
+{
+  if (channels.empty()) {
+    return std::size_t{0};
+  }
+
+  auto channel_index = std::min<std::size_t>(address_mapping.get_channel(packet.address), channels.size() - 1);
+  if (!cpu_channel_map.empty() && packet.cpu != std::numeric_limits<std::uint32_t>::max()) {
+    const auto cpu_idx = static_cast<std::size_t>(packet.cpu);
+    if (cpu_idx < cpu_channel_map.size() && cpu_channel_map[cpu_idx] != invalid_channel_index) {
+      channel_index = cpu_channel_map[cpu_idx] % channels.size();
+    }
+  }
+
+  return channel_index;
+}
+
+bool MEMORY_CONTROLLER::enqueue_read_request(const request_type& packet, champsim::channel* ul,
+                                             champsim::chrono::clock::duration extra_latency)
+{
+  if (channels.empty()) {
+    return false;
+  }
+
+  auto channel_index = select_channel(packet);
+  auto& channel = channels.at(channel_index);
+
+  if (auto rq_it = std::find_if_not(std::begin(channel.RQ), std::end(channel.RQ),
+                                    [](const auto& pkt) { return pkt.has_value(); });
       rq_it != std::end(channel.RQ)) {
     *rq_it = DRAM_CHANNEL::request_type{packet};
     rq_it->value().forward_checked = false;
     rq_it->value().scheduled = false;
     rq_it->value().ready_time = current_time;
     rq_it->value().extra_latency = extra_latency;
-    if (packet.response_requested)
+    if (packet.response_requested && ul != nullptr)
       rq_it->value().to_return = {&ul->returned};
 
     return true;
@@ -866,18 +1039,17 @@ bool MEMORY_CONTROLLER::add_rq(const request_type& packet, champsim::channel* ul
   return false;
 }
 
-bool MEMORY_CONTROLLER::add_wq(const request_type& packet)
+bool MEMORY_CONTROLLER::enqueue_write_request(const request_type& packet, champsim::chrono::clock::duration extra_latency)
 {
-  auto& channel = channels[address_mapping.get_channel(packet.address)];
-#ifdef ENABLE_CXL_DIRECTORY
-  const auto extra_latency = cxl_directory_latency(packet.address, packet.cpu) + (is_cxl_address(packet.address) ? cxl_round_trip_penalty : champsim::chrono::clock::duration::zero());
-#else
-  const auto extra_latency =
-      is_cxl_address(packet.address) ? cxl_round_trip_penalty : champsim::chrono::clock::duration::zero();
-#endif
+  if (channels.empty()) {
+    return false;
+  }
 
-  // search for the empty index
-  if (auto wq_it = std::find_if_not(std::begin(channel.WQ), std::end(channel.WQ), [](const auto& pkt) { return pkt.has_value(); });
+  auto channel_index = select_channel(packet);
+  auto& channel = channels.at(channel_index);
+
+  if (auto wq_it = std::find_if_not(std::begin(channel.WQ), std::end(channel.WQ),
+                                    [](const auto& pkt) { return pkt.has_value(); });
       wq_it != std::end(channel.WQ)) {
     *wq_it = DRAM_CHANNEL::request_type{packet};
     wq_it->value().forward_checked = false;
@@ -890,6 +1062,27 @@ bool MEMORY_CONTROLLER::add_wq(const request_type& packet)
 
   ++channel.sim_stats.WQ_FULL;
   return false;
+}
+
+void MEMORY_CONTROLLER::process_pending_requests()
+{
+  auto now = current_time;
+  auto it = pending_requests.begin();
+  while (it != pending_requests.end()) {
+    if (it->ready_time > now) {
+      ++it;
+      continue;
+    }
+
+    bool enqueued = it->is_write ? enqueue_write_request(it->packet, it->residual_latency)
+                                 : enqueue_read_request(it->packet, it->source, it->residual_latency);
+    if (enqueued) {
+      it = pending_requests.erase(it);
+    } else {
+      it->ready_time = now + clock_period;
+      ++it;
+    }
+  }
 }
 
 unsigned long DRAM_ADDRESS_MAPPING::swizzle_bits(champsim::address address, unsigned long segment_size, champsim::data::bits segment_offset,
@@ -959,7 +1152,7 @@ std::size_t DRAM_ADDRESS_MAPPING::bankgroups() const { return std::size_t{1} << 
 std::size_t DRAM_ADDRESS_MAPPING::banks() const { return std::size_t{1} << champsim::size(get<SLICER_BANK_IDX>(address_slicer)); }
 std::size_t DRAM_ADDRESS_MAPPING::channels() const { return std::size_t{1} << champsim::size(get<SLICER_CHANNEL_IDX>(address_slicer)); }
 std::size_t DRAM_CHANNEL::bank_request_capacity() const { return std::size(bank_request); }
-std::size_t DRAM_CHANNEL::bankgroup_request_capacity() const { return std::size(bankgroup_readytime); };
+std::size_t DRAM_CHANNEL::bankgroup_request_capacity() const { return std::size(bankgroup_readytime); }
 
 // LCOV_EXCL_START Exclude the following function from LCOV
 void MEMORY_CONTROLLER::print_deadlock()
@@ -996,6 +1189,9 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(const MEMORY_CONTROLLER& other)
       cxl_directory_pages_per_entry(other.cxl_directory_pages_per_entry),
       cxl_directory_words_per_entry(other.cxl_directory_words_per_entry),
       cxl_directory(other.cxl_directory),
+      shared_directory_cache(other.shared_directory_cache),
+      directory_latency_sim_stats(other.directory_latency_sim_stats),
+      directory_latency_roi_stats(other.directory_latency_roi_stats),
 #ifdef ENABLE_CXL_DIRECTORY_CACHE
       cxl_host_cpu_ids(other.cxl_host_cpu_ids),
       cxl_host_names(other.cxl_host_names),
@@ -1004,16 +1200,24 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(const MEMORY_CONTROLLER& other)
       cpu_to_host_local_index(other.cpu_to_host_local_index),
       host_cache_sim_stats(other.host_cache_sim_stats),
       host_cache_roi_stats(other.host_cache_roi_stats),
+#else
+      shared_cache_sim_lookups(other.shared_cache_sim_lookups),
+      shared_cache_sim_hits(other.shared_cache_sim_hits),
+      shared_cache_sim_misses(other.shared_cache_sim_misses),
+      shared_cache_roi_lookups(other.shared_cache_roi_lookups),
+      shared_cache_roi_hits(other.shared_cache_roi_hits),
+      shared_cache_roi_misses(other.shared_cache_roi_misses),
 #endif
 #endif
-      channels(other.channels)
+      channels(other.channels),
+      cpu_channel_map(other.cpu_channel_map),
+      pending_requests(other.pending_requests)
 {
   auto rebind_active = [](const DRAM_CHANNEL& src, DRAM_CHANNEL& dst) {
     if (src.active_request == std::end(src.bank_request)) {
       dst.active_request = std::end(dst.bank_request);
       return;
     }
-
     using const_iter = DRAM_CHANNEL::request_array_type::const_iterator;
     auto offset = std::distance(src.bank_request.cbegin(), const_iter{src.active_request});
     dst.active_request = std::begin(dst.bank_request) + offset;
@@ -1037,6 +1241,9 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept
       cxl_directory_pages_per_entry(other.cxl_directory_pages_per_entry),
       cxl_directory_words_per_entry(other.cxl_directory_words_per_entry),
       cxl_directory(std::move(other.cxl_directory)),
+      shared_directory_cache(std::move(other.shared_directory_cache)),
+      directory_latency_sim_stats(other.directory_latency_sim_stats),
+      directory_latency_roi_stats(other.directory_latency_roi_stats),
 #ifdef ENABLE_CXL_DIRECTORY_CACHE
       cxl_host_cpu_ids(std::move(other.cxl_host_cpu_ids)),
       cxl_host_names(std::move(other.cxl_host_names)),
@@ -1045,9 +1252,18 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept
       cpu_to_host_local_index(std::move(other.cpu_to_host_local_index)),
       host_cache_sim_stats(std::move(other.host_cache_sim_stats)),
       host_cache_roi_stats(std::move(other.host_cache_roi_stats)),
+#else
+      shared_cache_sim_lookups(other.shared_cache_sim_lookups),
+      shared_cache_sim_hits(other.shared_cache_sim_hits),
+      shared_cache_sim_misses(other.shared_cache_sim_misses),
+      shared_cache_roi_lookups(other.shared_cache_roi_lookups),
+      shared_cache_roi_hits(other.shared_cache_roi_hits),
+      shared_cache_roi_misses(other.shared_cache_roi_misses),
 #endif
 #endif
-      channels()
+      channels(),
+      cpu_channel_map(std::move(other.cpu_channel_map)),
+      pending_requests(std::move(other.pending_requests))
 {
   std::vector<std::optional<std::size_t>> active_offsets;
   active_offsets.reserve(other.channels.size());
@@ -1065,10 +1281,19 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept
 #ifdef ENABLE_CXL_DIRECTORY
   other.cxl_directory_pages_per_entry = 1;
   other.cxl_directory_words_per_entry = 0;
+  other.directory_latency_sim_stats = {};
+  other.directory_latency_roi_stats = {};
 #ifdef ENABLE_CXL_DIRECTORY_CACHE
   other.cxl_host_names.clear();
   other.host_cache_sim_stats.clear();
   other.host_cache_roi_stats.clear();
+#else
+  other.shared_cache_sim_lookups = 0;
+  other.shared_cache_sim_hits = 0;
+  other.shared_cache_sim_misses = 0;
+  other.shared_cache_roi_lookups = 0;
+  other.shared_cache_roi_hits = 0;
+  other.shared_cache_roi_misses = 0;
 #endif
 #endif
 
@@ -1080,4 +1305,6 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(MEMORY_CONTROLLER&& other) noexcept
       channels.at(i).active_request = std::begin(channels.at(i).bank_request) + static_cast<std::ptrdiff_t>(*idx);
     }
   }
+
+  other.pending_requests.clear();
 }

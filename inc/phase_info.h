@@ -55,6 +55,13 @@ struct phase_stats {
     };
     std::vector<directory_cache_stats> roi_directory_cache;
     std::vector<directory_cache_stats> sim_directory_cache;
+    struct directory_latency_stats {
+      std::uint64_t total = 0;
+      std::uint64_t dram = 0;
+      std::uint64_t cache = 0;
+    };
+    directory_latency_stats roi_directory_latency;
+    directory_latency_stats sim_directory_latency;
   };
   std::vector<dram_host_stats> dram_stats;
 };

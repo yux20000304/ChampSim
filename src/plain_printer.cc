@@ -184,7 +184,6 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
       auto sublines = format(channel_stat);
       std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
     }
-#ifdef ENABLE_CXL_DIRECTORY_CACHE
     if (!host_stat.sim_directory_cache.empty()) {
       lines.emplace_back("  Directory Cache");
       for (const auto& cache_stat : host_stat.sim_directory_cache) {
@@ -192,6 +191,12 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
                                        cache_stat.name, cache_stat.lookups, cache_stat.hits, cache_stat.misses,
                                        ::print_ratio(cache_stat.hits, cache_stat.lookups)));
       }
+    }
+#ifdef ENABLE_CXL_DIRECTORY
+    if (host_stat.sim_directory_latency.total > 0) {
+      lines.emplace_back(fmt::format("  Directory Latency total: {} ps (DRAM: {} ps, Cache: {} ps)",
+                                     host_stat.sim_directory_latency.total, host_stat.sim_directory_latency.dram,
+                                     host_stat.sim_directory_latency.cache));
     }
 #endif
   }
@@ -221,7 +226,6 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
       auto sublines = format(channel_stat);
       std::move(std::begin(sublines), std::end(sublines), std::back_inserter(lines));
     }
-#ifdef ENABLE_CXL_DIRECTORY_CACHE
     if (!host_stat.roi_directory_cache.empty()) {
       lines.emplace_back("  Directory Cache");
       for (const auto& cache_stat : host_stat.roi_directory_cache) {
@@ -229,6 +233,12 @@ std::vector<std::string> champsim::plain_printer::format(champsim::phase_stats& 
                                        cache_stat.name, cache_stat.lookups, cache_stat.hits, cache_stat.misses,
                                        ::print_ratio(cache_stat.hits, cache_stat.lookups)));
       }
+    }
+#ifdef ENABLE_CXL_DIRECTORY
+    if (host_stat.roi_directory_latency.total > 0) {
+      lines.emplace_back(fmt::format("  Directory Latency total: {} ps (DRAM: {} ps, Cache: {} ps)",
+                                     host_stat.roi_directory_latency.total, host_stat.roi_directory_latency.dram,
+                                     host_stat.roi_directory_latency.cache));
     }
 #endif
   }

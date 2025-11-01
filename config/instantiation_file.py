@@ -22,7 +22,7 @@ import multiprocessing as mp
 from . import util
 from . import cxx
 
-pmem_fmtstr = 'champsim::chrono::picoseconds{{{clock_period_dbus}}}, champsim::chrono::picoseconds{{{clock_period_mc}}}, std::size_t{{{_tRP}}}, std::size_t{{{_tRCD}}}, std::size_t{{{_tCAS}}}, std::size_t{{{_tRAS}}}, std::size_t{{{_tWR}}}, champsim::chrono::microseconds{{{_refresh_period}}}, {{{_ulptr}}}, {rq_size}, {wq_size}, {channels}, champsim::data::bytes{{{channel_width}}}, {_bank_rows}, {_bank_columns}, {ranks}, {bankgroups}, {banks}, {_refreshes_per_period}, double{{{cxl_ratio}}}, champsim::chrono::picoseconds{{{cxl_round_trip_penalty_ps}}}, std::size_t{{{cxl_directory_pages_per_entry}}}'
+pmem_fmtstr = 'champsim::chrono::picoseconds{{{clock_period_dbus}}}, champsim::chrono::picoseconds{{{clock_period_mc}}}, std::size_t{{{_tRP}}}, std::size_t{{{_tRCD}}}, std::size_t{{{_tCAS}}}, std::size_t{{{_tRAS}}}, std::size_t{{{_tWR}}}, champsim::chrono::microseconds{{{_refresh_period}}}, {{{_ulptr}}}, {rq_size}, {wq_size}, {channels}, champsim::data::bytes{{{channel_width}}}, {_bank_rows}, {_bank_columns}, {ranks}, {bankgroups}, {banks}, {_refreshes_per_period}, double{{{cxl_ratio}}}, champsim::chrono::picoseconds{{{cxl_round_trip_penalty_ps}}}, std::size_t{{{cxl_directory_pages_per_entry}}}, std::size_t{{{cxl_directory_cache_entries}}}, champsim::chrono::picoseconds{{{cxl_directory_cache_read_penalty_ps}}}, std::size_t{{{cxl_directory_cache_max_requests_per_cycle}}}'
 vmem_fmtstr = 'champsim::data::bytes{{{pte_page_size}}}, {num_levels}, champsim::chrono::picoseconds{{{clock_period}*{minor_fault_penalty}}}, {dram_name}, {_randomization}'
 
 queue_fmtstr = '{rq_size}, {pq_size}, {wq_size}, champsim::data::bits{{{_offset_bits}}}, {_queue_check_full_addr:b}'
@@ -345,7 +345,7 @@ def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build
 
     dram_inits = []
     for pmem in pmems:
-        pmem_format_args = {k: v for k, v in pmem.items() if k not in ('cxl_ratio', 'cxl_round_trip_penalty_ps', 'cxl_directory_pages_per_entry', 'tWR')}
+        pmem_format_args = {k: v for k, v in pmem.items() if k not in ('cxl_ratio', 'cxl_round_trip_penalty_ps', 'cxl_directory_pages_per_entry', 'tWR', 'cxl_directory_cache_entries', 'cxl_directory_cache_read_penalty_ps', 'cxl_directory_cache_max_requests_per_cycle')}
         dram_body = pmem_fmtstr.format(
             clock_period_dbus=int(1000000/pmem['data_rate']),
             clock_period_mc=int(1000000/pmem['frequency']),
@@ -362,6 +362,9 @@ def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build
             cxl_ratio=pmem['cxl_ratio'],
             cxl_round_trip_penalty_ps=int(pmem['cxl_round_trip_penalty_ps']),
             cxl_directory_pages_per_entry=int(pmem.get('cxl_directory_pages_per_entry', 1)),
+            cxl_directory_cache_entries=int(pmem.get('cxl_directory_cache_entries', 0)),
+            cxl_directory_cache_read_penalty_ps=int(pmem.get('cxl_directory_cache_read_penalty_ps', 0)),
+            cxl_directory_cache_max_requests_per_cycle=int(pmem.get('cxl_directory_cache_max_requests_per_cycle', 0)),
             **pmem_format_args
         )
         dram_inits.append(f'MEMORY_CONTROLLER{{{dram_body}}}')
@@ -472,9 +475,11 @@ def get_instantiation_lines(cores, caches, ptws, pmems, vmems, hosts=None, build
                 f'    {host_cpu_literal},',
                 f'    {host_name_literal},',
                 f'    std::size_t{{{pmem.get("cxl_directory_cache_entries", 0)}}},',
-                f'    champsim::chrono::picoseconds{{{pmem.get("cxl_directory_cache_read_penalty_ps", 0)}}});',
+                f'    champsim::chrono::picoseconds{{{pmem.get("cxl_directory_cache_read_penalty_ps", 0)}}},',
+                f'    std::size_t{{{pmem.get("cxl_directory_cache_max_requests_per_cycle", 0)}}});',
                 '#endif'
             ])
+            constructor_body_lines.append(f'drams.at({idx}).bind_host_channels({host_cpu_literal});')
 
     yield '{'
     for line in constructor_body_lines:

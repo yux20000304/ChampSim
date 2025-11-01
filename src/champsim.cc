@@ -29,7 +29,7 @@
 #include "phase_info.h"
 #include "tracereader.h"
 
-constexpr int DEADLOCK_CYCLE{5000};
+constexpr int DEADLOCK_CYCLE{500000000};
 
 const auto start_time = std::chrono::steady_clock::now();
 
@@ -123,8 +123,12 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
     }
 
     if (stalled_cycle >= DEADLOCK_CYCLE || livelock_trigger) {
-      std::for_each(std::begin(operables), std::end(operables), [](champsim::operable& c) { c.print_deadlock(); });
-      abort();
+      fmt::print("{} detected deadlock or livelock!\n", phase_name);
+      stalled_cycle = 0;
+      livelock_trigger = false;
+      livelock_timer = 0;
+      // std::for_each(std::begin(operables), std::end(operables), [](champsim::operable& c) { c.print_deadlock(); });
+      // abort();
     }
 
     // If any trace reaches EOF, terminate all phases
@@ -206,6 +210,33 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
       cache_stat.misses = roi_cache_stats[cache_idx].misses;
       host_stat.roi_directory_cache.push_back(cache_stat);
     }
+#else
+    if (dram.shared_directory_cache_enabled()) {
+      phase_stats::dram_host_stats::directory_cache_stats sim_cache_stat;
+      sim_cache_stat.name = "shared";
+      sim_cache_stat.lookups = dram.shared_directory_cache_sim_lookups();
+      sim_cache_stat.hits = dram.shared_directory_cache_sim_hits();
+      sim_cache_stat.misses = dram.shared_directory_cache_sim_misses();
+      host_stat.sim_directory_cache.push_back(sim_cache_stat);
+
+      phase_stats::dram_host_stats::directory_cache_stats roi_cache_stat;
+      roi_cache_stat.name = "shared";
+      roi_cache_stat.lookups = dram.shared_directory_cache_roi_lookups();
+      roi_cache_stat.hits = dram.shared_directory_cache_roi_hits();
+      roi_cache_stat.misses = dram.shared_directory_cache_roi_misses();
+      host_stat.roi_directory_cache.push_back(roi_cache_stat);
+    }
+#endif
+#ifdef ENABLE_CXL_DIRECTORY
+    const auto& sim_dir_latency = dram.directory_latency_sim_breakdown();
+    host_stat.sim_directory_latency.total = static_cast<std::uint64_t>(sim_dir_latency.total.count());
+    host_stat.sim_directory_latency.dram = static_cast<std::uint64_t>(sim_dir_latency.dram.count());
+    host_stat.sim_directory_latency.cache = static_cast<std::uint64_t>(sim_dir_latency.cache.count());
+
+    const auto& roi_dir_latency = dram.directory_latency_roi_breakdown();
+    host_stat.roi_directory_latency.total = static_cast<std::uint64_t>(roi_dir_latency.total.count());
+    host_stat.roi_directory_latency.dram = static_cast<std::uint64_t>(roi_dir_latency.dram.count());
+    host_stat.roi_directory_latency.cache = static_cast<std::uint64_t>(roi_dir_latency.cache.count());
 #endif
     stats.dram_stats.push_back(std::move(host_stat));
   }

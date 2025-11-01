@@ -169,7 +169,10 @@
     "refreshes_per_period": 8192,
     "cxl_ratio": 1,
     "cxl_round_trip_penalty_ps": 85000,
-    "cxl_directory_pages_per_entry": 1
+    "cxl_directory_pages_per_entry": 1,
+    "cxl_directory_cache_entries": 32,
+    "cxl_directory_cache_read_penalty_ps": 2000,
+    "cxl_directory_cache_max_requests_per_cycle": 32
   },
   "virtual_memory": {
     "pte_page_size": 4096,

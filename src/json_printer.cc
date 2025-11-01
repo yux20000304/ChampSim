@@ -93,8 +93,18 @@ void to_json(nlohmann::json& j, const champsim::phase_stats stats)
   nlohmann::json dram_roi = nlohmann::json::array();
   nlohmann::json dram_sim = nlohmann::json::array();
   for (const auto& host_stat : stats.dram_stats) {
-    dram_roi.push_back({{"host", host_stat.host_name}, {"channels", host_stat.roi_channels}});
-    dram_sim.push_back({{"host", host_stat.host_name}, {"channels", host_stat.sim_channels}});
+    nlohmann::json roi_obj{{"host", host_stat.host_name}, {"channels", host_stat.roi_channels}};
+    nlohmann::json sim_obj{{"host", host_stat.host_name}, {"channels", host_stat.sim_channels}};
+#ifdef ENABLE_CXL_DIRECTORY
+    roi_obj["directory_latency"] = {{"total_ps", host_stat.roi_directory_latency.total},
+                                     {"dram_ps", host_stat.roi_directory_latency.dram},
+                                     {"cache_ps", host_stat.roi_directory_latency.cache}};
+    sim_obj["directory_latency"] = {{"total_ps", host_stat.sim_directory_latency.total},
+                                     {"dram_ps", host_stat.sim_directory_latency.dram},
+                                     {"cache_ps", host_stat.sim_directory_latency.cache}};
+#endif
+    dram_roi.push_back(std::move(roi_obj));
+    dram_sim.push_back(std::move(sim_obj));
   }
   roi_stats.emplace("DRAM", dram_roi);
   for (auto x : stats.roi_cache_stats) {
